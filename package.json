@@ -1,0 +1,66 @@
+{
+  "name": "vscode-git-ask",
+  "displayName": "Git Ask",
+  "description": "Ask git history questions in plain English for any file",
+  "version": "1.0.0",
+  "publisher": "naveengit9",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Other"],
+  "icon": "icon.png",
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "gitask.trace",
+        "title": "Git Ask: Trace this line's lifecycle (when added / removed)"
+      },
+      {
+        "command": "gitask.fullHistory",
+        "title": "Git Ask: Show full commit history of this file"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "gitask.trace",
+          "group": "gitask@1",
+          "when": "editorIsOpen"
+        },
+        {
+          "command": "gitask.fullHistory",
+          "group": "gitask@2",
+          "when": "editorIsOpen"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "gitask.trace",
+          "group": "gitask@1"
+        },
+        {
+          "command": "gitask.fullHistory",
+          "group": "gitask@2"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "gitask.trace",
+        "key": "ctrl+shift+g ctrl+shift+t",
+        "mac": "cmd+shift+g cmd+shift+t"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.24.0",
+    "typescript": "^5.3.0"
+  }
+}

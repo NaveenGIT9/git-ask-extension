@@ -17,7 +17,7 @@
       },
       {
         "command": "gitask.fullHistory",
-        "title": "Git Trace: Full history (incl. merge commits)"
+        "title": "Git Ask: Full history (incl. merge commits)"
       },
       {
         "command": "gitask.traceRemoved",

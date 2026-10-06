@@ -128,7 +128,7 @@ function parsePickaxeOutput(raw: string, searchString: string): CommitEntry[] {
             const [hash, date, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
             current = {
                 hash: hash.trim(),
-                shortHash: hash.trim().slice(0, 10),
+                shortHash: hash.trim().slice(0, 7),
                 date: date.trim(),
                 author: author.trim(),
                 message: msg.join('|').trim(),
@@ -164,7 +164,7 @@ function parseLogOutput(raw: string): CommitEntry[] {
             const [hash, date, author, ...msg] = line.split('|');
             return {
                 hash: hash.trim(),
-                shortHash: hash.trim().slice(0, 10),
+                shortHash: hash.trim().slice(0, 7),
                 date: date.trim(),
                 author: author.trim(),
                 message: msg.join('|').trim(),
@@ -190,7 +190,7 @@ function parseLogOutputWithMerges(raw: string): CommitEntry[] {
         const isMerge = parents.length > 1;
         commits.push({
             hash: h,
-            shortHash: h.slice(0, 10),
+            shortHash: h.slice(0, 7),
             date: date.trim(),
             author: author.trim(),
             message,
@@ -264,7 +264,7 @@ function findHiddenRemovals(
         const e = entries[lo];
         result.push({
             hash:      e.hash,
-            shortHash: e.hash.slice(0, 10),
+            shortHash: e.hash.slice(0, 7),
             date:      e.date,
             author:    e.author,
             message:   e.message,
@@ -327,7 +327,7 @@ function chainEntry(info: CommitInfo, role: 'dropped' | 'carried', note: string)
     const isMerge = info.parents.length > 1;
     return {
         hash:           info.hash,
-        shortHash:      info.hash.slice(0, 10),
+        shortHash:      info.hash.slice(0, 7),
         date:           info.date,
         author:         info.author,
         message:        info.message,

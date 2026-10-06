@@ -11,6 +11,18 @@ function actionBadge(action?: string): string {
     return '';
 }
 
+// "2026-10-06" -> "Oct 6th 2026" (display only; the ISO string stays as the sort key)
+function formatDate(iso: string): string {
+    const m = iso.match(/^(\d{4})-(\d{2})-(\d{2})/);
+    if (!m) return iso;
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const day = parseInt(m[3], 10);
+    const month = months[parseInt(m[2], 10) - 1];
+    if (!month || !day) return iso;
+    const suffix = day % 100 >= 11 && day % 100 <= 13 ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' } as Record<number, string>)[day % 10] ?? 'th';
+    return `${month} ${day}${suffix} ${m[1]}`;
+}
+
 function escapeHtml(s: string): string {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -34,6 +46,12 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
                 ? `<a class="origin-branch branch-link" data-url="${branchUrl}" title="Open branch on GitHub"><span class="origin-label">origin:</span>${escapeHtml(c.originBranch)}</a>`
                 : `<span class="origin-branch"><span class="origin-label">origin:</span>${escapeHtml(c.originBranch)}</span>`
             : '';
+        const branchLink = (name: string): string => githubBaseUrl
+            ? `<a class="origin-branch branch-link" data-url="${githubBaseUrl}/tree/${name.split('/').map(encodeURIComponent).join('/')}" title="Open branch on GitHub">${escapeHtml(name)}</a>`
+            : `<span class="origin-branch">${escapeHtml(name)}</span>`;
+        const whereEl = c.removalRole && (c.mergeInto || c.mergeFrom)
+            ? `<span class="where">${c.mergeInto ? `<span class="where-label">on</span>${branchLink(c.mergeInto)}` : ''}${c.mergeFrom ? `<span class="where-label">while merging</span>${branchLink(c.mergeFrom)}` : ''}</span>`
+            : '';
         const mergeBadge = c.isAutoConflict
             ? `<span class="badge auto-conflict">⚠ auto-merge</span>`
             : c.isMerge
@@ -53,10 +71,11 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
                 ${actionBadge(c.action)}
                 ${roleBadge}
                 ${mergeBadge}
-                <span class="date">${escapeHtml(c.date)}</span>
+                <span class="date">${escapeHtml(formatDate(c.date))}</span>
                 ${hashEl}
                 <span class="author">${escapeHtml(c.author)}</span>
                 ${branchEl}
+                ${whereEl}
             </div>
             <div class="message">${escapeHtml(c.message)}</div>
             ${c.note ? `<div class="note">${escapeHtml(c.note)}</div>` : ''}
@@ -135,6 +154,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     border-left-color: #f47474;
     background: color-mix(in srgb, var(--vscode-editorWidget-background, #252526) 90%, #f47474 10%);
   }
+  .where { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 11px; }
+  .where-label { color: var(--vscode-descriptionForeground, #858585); font-style: italic; }
   .note {
     margin-top: 6px;
     font-size: 12px;

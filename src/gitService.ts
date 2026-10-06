@@ -18,6 +18,10 @@ export interface CommitEntry {
     //   'carried' = a merge that brought an earlier removal into the queried branch
     removalRole?: 'dropped' | 'carried';
     note?: string;
+    // For those merges: "Merging <mergeFrom> to <mergeInto>" - the mistake happened ON mergeInto while
+    // merging mergeFrom in; it is not an "origin" of the change.
+    mergeInto?: string;
+    mergeFrom?: string;
 }
 
 export interface GitResult {
@@ -103,18 +107,30 @@ function getOriginBranch(hash: string, repoRoot: string, queryBranch: string): s
         }
 
         const raw = runArgs(
-            ['log', '--ancestry-path', '--merges', '--format=%s', `${hash}..${targetRef}`],
+            ['log', '--ancestry-path', '--merges', '--format=%H|%P|%s', `${hash}..${targetRef}`],
             repoRoot
         );
-        const msgs = raw.split('\n').map(l => l.trim()).filter(Boolean);
-        if (msgs.length === 0) return undefined;
+        const merges = raw.split('\n').map(l => l.trim()).filter(Boolean);
+        if (merges.length === 0) return undefined;
 
         // Last entry = oldest merge = the one that first introduced hash to this line
-        const oldest = msgs[msgs.length - 1];
-        const match = oldest.match(/Merging (.+?) (?:to|into) /i);
-        if (match) return match[1].trim();
+        const [, parentsRaw, ...subject] = merges[merges.length - 1].split('|');
+        const match = subject.join('|').match(/Merging (\S+) (?:to|into) (\S+)/i);
+        if (!match) return undefined;
+        const [, src, dst] = match;
+
+        // "Merging <src> to <dst>": the commit only came from <src> if it is part of the merged-in
+        // (second) parent. If it was already on <dst>'s own history it was committed directly on
+        // <dst>, and the merge of some other branch afterwards says nothing about where it came from.
+        const secondParent = parentsRaw.trim().split(/\s+/)[1];
+        if (secondParent && !isAncestor(hash, secondParent, repoRoot)) return dst.trim();
+        return src.trim();
     } catch { /* non-fatal */ }
     return undefined;
+}
+
+function isAncestor(ancestor: string, descendant: string, repoRoot: string): boolean {
+    return spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot }).status === 0;
 }
 
 function parsePickaxeOutput(raw: string, searchString: string): CommitEntry[] {
@@ -325,6 +341,7 @@ function firstParentPickaxe(range: string, searchString: string, relFile: string
 
 function chainEntry(info: CommitInfo, role: 'dropped' | 'carried', note: string): CommitEntry {
     const isMerge = info.parents.length > 1;
+    const { src, dst } = isMerge ? parseMergeMessage(info.message) : { src: undefined, dst: undefined };
     return {
         hash:           info.hash,
         shortHash:      info.hash.slice(0, 7),
@@ -337,16 +354,17 @@ function chainEntry(info: CommitInfo, role: 'dropped' | 'carried', note: string)
         isAutoConflict: isMerge && info.message.toLowerCase().includes('auto conflict'),
         removalRole:    role,
         note,
-        // For these commits the branch that matters is the one named in the merge message
-        // ("Merging <src> to <dst>"), not the next merge on the way to the queried branch.
-        originBranch:   isMerge ? parseMergeMessage(info.message).src : undefined,
+        mergeFrom:      src,
+        mergeInto:      dst,
     };
 }
 
 /**
- * When the searched line is no longer in the file at the branch tip, explain WHY.
+ * Explain every point where the searched line disappeared from the branch - whether or not it is
+ * back in the file now (a line that was removed by a merge and later re-added still has that
+ * removal in its lifecycle).
  *
- * Walks the branch's first-parent history to the commit where the line vanished, then, if that is a
+ * Walks the branch's first-parent history to each commit where the line vanished, then, if that is a
  * merge, inspects its two parents:
  *   - base had the line and the other side removed it  -> this merge only CARRIED the removal in;
  *     descend into that side to find the real removal.
@@ -363,7 +381,6 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
     };
 
     const tip = branch === '--all' ? 'HEAD' : branch;
-    if (has(tip)) return [];   // the line is still there - nothing to explain
 
     const removalIn = (range: string): string | undefined =>
         firstParentPickaxe(range, searchString, relFile, repoRoot).find(h => !has(h));
@@ -396,8 +413,9 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
         if (!base || !has(base)) {
             const who = lackingBranch ?? 'the other side';
             return [chainEntry(info, 'dropped',
-                `The line existed on one side of this merge, but ${who} never had it (its copy of the file predates the line). ` +
-                `The merge result lost the line - typically the auto conflict resolution kept ${who}'s version of the file.`)];
+                `The line was lost by this merge itself, not by a commit in ${who}. It existed on ${pHas === pA ? (dst ?? 'the target branch') : (src ?? 'the other side')}, ` +
+                `but ${who}'s copy of the file predates the line, and the merge result ended up with that older copy ` +
+                `(typically the auto conflict resolution kept ${who}'s version of the file).`)];
         }
 
         const carried = chainEntry(info, 'carried',
@@ -406,12 +424,29 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
         return inner ? [carried, ...locate(inner, depth + 1)] : [carried];
     };
 
-    const top = removalIn(tip);
-    return top ? locate(top, 0) : [];
+    // Every commit on the branch's own history where the line went from present to absent
+    // (a commit that only lowered the count while the line is still present is skipped by has()).
+    const removals = firstParentPickaxe(tip, searchString, relFile, repoRoot)
+        .filter(h => !has(h))
+        .slice(0, 10);
+
+    const seen = new Set<string>();
+    const chain: CommitEntry[] = [];
+    for (const hash of removals) {
+        for (const entry of locate(hash, 0)) {
+            if (seen.has(entry.hash)) continue;
+            seen.add(entry.hash);
+            chain.push(entry);
+        }
+    }
+    return chain;   // newest first
 }
 
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
-    return commits.map(c => ({ ...c, originBranch: c.originBranch ?? getOriginBranch(c.hash, repoRoot, queryBranch) }));
+    // The "lost here" / "carried in" merges are described by mergeFrom/mergeInto instead of an origin.
+    return commits.map(c => c.removalRole
+        ? c
+        : { ...c, originBranch: getOriginBranch(c.hash, repoRoot, queryBranch) });
 }
 
 export async function executeIntent(intent: Intent): Promise<GitResult> {

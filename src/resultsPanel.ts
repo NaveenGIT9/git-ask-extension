@@ -26,15 +26,40 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
         const hashEl     = commitUrl
             ? `<a class="hash hash-link" data-url="${commitUrl}" title="Open on GitHub">${escapeHtml(c.shortHash)}</a>`
             : `<code class="hash">${escapeHtml(c.shortHash)}</code>`;
+        const branchUrl = c.originBranch && githubBaseUrl
+            ? `${githubBaseUrl}/tree/${c.originBranch.split('/').map(encodeURIComponent).join('/')}`
+            : '';
+        const branchEl = c.originBranch
+            ? branchUrl
+                ? `<a class="origin-branch branch-link" data-url="${branchUrl}" title="Open branch on GitHub"><span class="origin-label">origin:</span>${escapeHtml(c.originBranch)}</a>`
+                : `<span class="origin-branch"><span class="origin-label">origin:</span>${escapeHtml(c.originBranch)}</span>`
+            : '';
+        const mergeBadge = c.isAutoConflict
+            ? `<span class="badge auto-conflict">⚠ auto-merge</span>`
+            : c.isMerge
+            ? `<span class="badge merge-badge">⇄ merge</span>`
+            : '';
+        const roleBadge = c.removalRole === 'dropped'
+            ? `<span class="badge dropped-badge">✖ line lost here</span>`
+            : c.removalRole === 'carried'
+            ? `<span class="badge carried-badge">↳ carried removal in</span>`
+            : '';
+        const commitClass = c.removalRole === 'dropped'
+            ? 'commit dropped-commit'
+            : c.isAutoConflict ? 'commit conflict-commit' : 'commit';
         return `
-        <div class="commit">
+        <div class="${commitClass}">
             <div class="commit-header">
                 ${actionBadge(c.action)}
+                ${roleBadge}
+                ${mergeBadge}
                 <span class="date">${escapeHtml(c.date)}</span>
                 ${hashEl}
                 <span class="author">${escapeHtml(c.author)}</span>
+                ${branchEl}
             </div>
             <div class="message">${escapeHtml(c.message)}</div>
+            ${c.note ? `<div class="note">${escapeHtml(c.note)}</div>` : ''}
             ${c.lines && c.lines.length > 0 ? `
             <div class="diff-lines">
                 ${c.lines.map(l => {
@@ -102,6 +127,30 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     background: var(--vscode-editorWidget-background, #252526);
     border-radius: 4px;
   }
+  .commit.conflict-commit {
+    border-left-color: #c98000;
+    background: color-mix(in srgb, var(--vscode-editorWidget-background, #252526) 92%, #c98000 8%);
+  }
+  .commit.dropped-commit {
+    border-left-color: #f47474;
+    background: color-mix(in srgb, var(--vscode-editorWidget-background, #252526) 90%, #f47474 10%);
+  }
+  .note {
+    margin-top: 6px;
+    font-size: 12px;
+    color: var(--vscode-descriptionForeground, #b0b0b0);
+    border-left: 2px solid #7a5000;
+    padding-left: 8px;
+  }
+  .merge-legend {
+    font-size: 11px;
+    color: var(--vscode-descriptionForeground, #858585);
+    margin: 6px 0 14px;
+    display: flex;
+    gap: 14px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
   .commit-header {
     display: flex;
     align-items: center;
@@ -117,14 +166,22 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     text-transform: uppercase;
     letter-spacing: 0.5px;
   }
-  .badge.added   { background: #1a472a; color: #4ec94e; }
-  .badge.removed { background: #4a1a1a; color: #f47474; }
-  .badge.modified{ background: #3a3a1a; color: #e5c07b; }
+  .badge.added         { background: #1a472a; color: #4ec94e; }
+  .badge.removed       { background: #4a1a1a; color: #f47474; }
+  .badge.modified      { background: #3a3a1a; color: #e5c07b; }
+  .badge.auto-conflict { background: #4a2e00; color: #e0a000; border: 1px solid #7a5000; }
+  .badge.merge-badge   { background: #1a2a4a; color: #5a9aff; border: 1px solid #2a4a7a; }
+  .badge.dropped-badge { background: #5a1a1a; color: #ff8a8a; border: 1px solid #a03a3a; }
+  .badge.carried-badge { background: #4a2e00; color: #e0a000; border: 1px solid #7a5000; }
   .date   { color: var(--vscode-descriptionForeground, #858585); font-size: 12px; }
   .hash   { background: var(--vscode-textBlockQuote-background, #333); padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #ce9178; font-family: monospace; }
   a.hash-link { text-decoration: none; cursor: pointer; border-bottom: 1px dashed #ce9178; }
   a.hash-link:hover { background: #555; border-bottom-style: solid; }
   .author { font-weight: 500; color: var(--vscode-textLink-foreground, #3794ff); }
+  .origin-branch { font-size: 10px; font-family: monospace; background: #2a3a2a; color: #7ec87e; border: 1px solid #3a5a3a; border-radius: 3px; padding: 1px 6px; display: inline-flex; align-items: center; gap: 4px; }
+  a.branch-link { text-decoration: none; cursor: pointer; }
+  a.branch-link:hover { background: #3a5a3a; border-color: #5a8a5a; }
+  .origin-label { color: #5a8a5a; font-weight: 700; font-style: italic; }
   .message { font-size: 13px; color: var(--vscode-editor-foreground, #d4d4d4); margin-top: 2px; }
   .diff-lines { margin-top: 8px; }
   .diff-line { padding: 2px 0; font-size: 12px; }
@@ -149,6 +206,12 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     ? `<div class="count-bar">${count} commit${count !== 1 ? 's' : ''} found</div>`
     : ''}
 
+  ${result.intent.type === 'FULL_HISTORY' ? `
+  <div class="merge-legend">
+    <span><span class="badge merge-badge">⇄ merge</span> = merge commit</span>
+    <span><span class="badge auto-conflict">⚠ auto-merge</span> = auto conflict resolution — may have silently dropped changes</span>
+  </div>` : ''}
+
   ${body}
 
   <div class="tip">
@@ -156,7 +219,7 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   </div>
   <script>
     const vscode = acquireVsCodeApi();
-    document.querySelectorAll('.hash-link').forEach(el => {
+    document.querySelectorAll('.hash-link, .branch-link').forEach(el => {
       el.addEventListener('click', () => {
         vscode.postMessage({ command: 'openLink', url: el.getAttribute('data-url') });
       });

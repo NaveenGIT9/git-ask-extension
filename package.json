@@ -17,7 +17,11 @@
       },
       {
         "command": "gitask.fullHistory",
-        "title": "Git Ask: Show full commit history of this file"
+        "title": "Git Trace: Full history (incl. merge commits)"
+      },
+      {
+        "command": "gitask.traceRemoved",
+        "title": "Git Ask: Trace a line that is no longer in the file (paste it)"
       }
     ],
     "menus": {
@@ -31,6 +35,11 @@
           "command": "gitask.fullHistory",
           "group": "gitask@2",
           "when": "editorIsOpen"
+        },
+        {
+          "command": "gitask.traceRemoved",
+          "group": "gitask@3",
+          "when": "editorIsOpen"
         }
       ],
       "explorer/context": [
@@ -41,6 +50,10 @@
         {
           "command": "gitask.fullHistory",
           "group": "gitask@2"
+        },
+        {
+          "command": "gitask.traceRemoved",
+          "group": "gitask@3"
         }
       ]
     },

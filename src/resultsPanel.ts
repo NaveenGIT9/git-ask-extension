@@ -117,6 +117,7 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     padding: 16px;
   }
   .header { margin-bottom: 16px; }
+  .scope-note { margin-top: 6px; font-size: 12px; color: var(--vscode-descriptionForeground, #9d9d9d); }
   .question {
     font-size: 15px;
     font-weight: 600;
@@ -221,6 +222,7 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     <div class="question">💬 "${escapeHtml(question)}"</div>
     <div class="subtitle">${escapeHtml(title)}</div>
     <div class="file-path">📄 ${escapeHtml(file)}</div>
+    ${result.scopeNote ? `<div class="scope-note">${escapeHtml(result.scopeNote)}</div>` : ''}
   </div>
 
   ${result.commits !== undefined && !result.error

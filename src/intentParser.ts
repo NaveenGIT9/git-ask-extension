@@ -2,14 +2,25 @@ export type IntentType =
     | 'FIND_ADDED'
     | 'FIND_REMOVED'
     | 'FIND_BOTH'
+    | 'LINE_HISTORY'
     | 'FULL_HISTORY'
     | 'RECENT_HISTORY'
     | 'SHOW_COMMIT'
     | 'BLAME'
     | 'SEARCH_ALL_BRANCHES';
 
+// The exact line(s) the user selected in the editor, with a little surrounding text (all trimmed).
+// Used to find those same lines in another revision and trace them by position instead of by text.
+export interface LineContext {
+    lines: string[];      // the selected line(s)
+    before: string[];     // up to 2 lines above the selection (nearest last)
+    after: string[];      // up to 2 lines below the selection (nearest first)
+    approxLine: number;   // 1-based first selected line in the editor
+}
+
 export interface Intent {
     type: IntentType;
+    lineContext?: LineContext;
     searchString?: string;
     branch?: string;
     commitHash?: string;
@@ -137,6 +148,8 @@ export function describeIntent(intent: Intent): string {
             return `Finding when "${intent.searchString}" was REMOVED${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'FIND_BOTH':
             return `Tracing full history of "${intent.searchString}"${intent.branch ? ` on ${intent.branch}` : ''}`;
+        case 'LINE_HISTORY':
+            return `Tracing this exact line by position${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'FULL_HISTORY':
             return `Showing full commit history of this file${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'RECENT_HISTORY':

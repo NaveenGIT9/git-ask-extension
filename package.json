@@ -2,10 +2,14 @@
   "name": "vscode-git-ask",
   "displayName": "Git Ask",
   "description": "Ask git history questions in plain English for any file",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "publisher": "naveengit9",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Other"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
   "icon": "icon.png",
   "activationEvents": [],
   "main": "./out/extension.js",

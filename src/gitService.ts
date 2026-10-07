@@ -1,6 +1,6 @@
 import { execSync, spawnSync } from 'child_process';
 import * as path from 'path';
-import { Intent } from './intentParser';
+import { Intent, LineContext } from './intentParser';
 
 export interface CommitEntry {
     hash: string;
@@ -32,6 +32,8 @@ export interface GitResult {
     repoRoot?: string;
     githubBaseUrl?: string;
     relativeFile?: string;
+    // One line saying how the result was found, e.g. "Line 1855 traced by position on origin/rbkqa".
+    scopeNote?: string;
 }
 
 function getGitHubBaseUrl(repoRoot: string): string | undefined {
@@ -442,6 +444,56 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
     return chain;   // newest first
 }
 
+// Finds where the selected line(s) sit in the file as it is at `rev`. The editor may be showing unsaved edits or
+// a different branch, so the editor's line number is only a hint: the lines are matched by content plus the
+// neighbouring lines, widest context first, and the candidate closest to the editor's line wins.
+function locateLines(relFile: string, rev: string, ctx: LineContext, repoRoot: string): { start: number; end: number } | undefined {
+    let text: string;
+    try { text = runArgs(['show', `${rev}:${relFile}`], repoRoot); } catch { return undefined; }
+    const file = text.split(/\r?\n/).map(l => l.trim());
+    const tail = (a: string[], n: number): string[] => (n > 0 ? a.slice(-n) : []);
+
+    for (const [b, a] of [[2, 2], [1, 1], [0, 0]]) {
+        const above = tail(ctx.before, b);
+        const pattern = [...above, ...ctx.lines, ...ctx.after.slice(0, a)];
+        const hits: number[] = [];
+        for (let i = 0; i + pattern.length <= file.length; i++) {
+            if (pattern.every((p, k) => file[i + k] === p)) hits.push(i + above.length + 1);
+        }
+        // With no context at all, an ambiguous match would be a guess, so only accept a unique one.
+        if (hits.length === 0 || (b === 0 && hits.length > 1)) continue;
+        const start = hits.reduce((best, h) => (Math.abs(h - ctx.approxLine) < Math.abs(best - ctx.approxLine) ? h : best));
+        return { start, end: start + ctx.lines.length - 1 };
+    }
+    return undefined;
+}
+
+// Parses `git log -L` output: each commit shows only the diff of the traced lines.
+function parseLineLog(raw: string): CommitEntry[] {
+    const commits: CommitEntry[] = [];
+    let current: CommitEntry | null = null;
+    for (const line of raw.split('\n')) {
+        if (line.startsWith('COMMIT_MARKER:')) {
+            if (current) commits.push(current);
+            const [hash, date, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
+            current = { hash: hash.trim(), shortHash: hash.trim().slice(0, 7), date: date.trim(), author: author.trim(), message: msg.join('|').trim(), lines: [] };
+            continue;
+        }
+        if (!current) continue;
+        if (line.startsWith('+') && !line.startsWith('+++')) current.lines!.push(`+ ${line.slice(1).trim()}`);
+        else if (line.startsWith('-') && !line.startsWith('---')) current.lines!.push(`- ${line.slice(1).trim()}`);
+    }
+    if (current) commits.push(current);
+    for (const c of commits) {
+        const added = c.lines!.some(l => l.startsWith('+'));
+        const removed = c.lines!.some(l => l.startsWith('-'));
+        c.action = added && removed ? '~' : added ? '+' : removed ? '-' : undefined;
+        // A commit listed with no diff for these lines is a merge that resolved them (e.g. a Copado conflict merge).
+        if (!c.lines!.length && /^Merging /i.test(c.message)) { c.isMerge = true; c.note = 'Merge commit: it resolved a conflict touching these lines (no line diff to show).'; }
+    }
+    return commits;
+}
+
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
     // The "lost here" / "carried in" merges are described by mergeFrom/mergeInto instead of an origin.
     return commits.map(c => c.removalRole
@@ -515,6 +567,31 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 }
 
                 return mk({ commits: enrichWithOriginBranch(commits, repoRoot, branch) });
+            }
+
+            case 'LINE_HISTORY': {
+                const ctx = intent.lineContext;
+                if (!ctx || ctx.lines.length === 0) return err('No line selected.');
+                // `git log -L` needs one concrete revision; with no branch given use what is checked out.
+                const rev = branch === '--all' ? 'HEAD' : branch;
+                const found = locateLines(relFile, rev, ctx, repoRoot);
+                if (!found) {
+                    // The line is not in the file at this revision (removed, or on another branch): the only way to find
+                    // it is by its text, which also matches every identical line in the file.
+                    const fallback = await executeIntent({ ...intent, type: 'FIND_BOTH', lineContext: undefined });
+                    return { ...fallback, scopeNote: `This line is not in the file on ${rev}, so its text was searched across the whole history. ` +
+                        `Identical lines elsewhere in the file can appear in the results.` };
+                }
+                const range = found.start === found.end ? `${found.start}` : `${found.start},${found.end}`;
+                const raw = runArgs(
+                    ['log', `-L${range}:${relFile}`, rev, '--format=COMMIT_MARKER:%H|%ad|%an|%s', '--date=format:%Y-%m-%d'],
+                    repoRoot
+                );
+                const lineLabel = found.start === found.end ? `Line ${found.start}` : `Lines ${found.start}-${found.end}`;
+                return mk({
+                    commits: enrichWithOriginBranch(parseLineLog(raw), repoRoot, branch),
+                    scopeNote: `${lineLabel} of ${rev} traced by position: only commits that changed these exact lines are shown.`,
+                });
             }
 
             case 'FULL_HISTORY': {

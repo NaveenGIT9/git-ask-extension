@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import { executeIntent } from './gitService';
 import { showResults } from './resultsPanel';
-import { Intent } from './intentParser';
+import { Intent, LineContext } from './intentParser';
 
 function getActiveFilePath(uri?: vscode.Uri): string | undefined {
     if (uri) return uri.fsPath;
@@ -29,6 +29,28 @@ function getSelectedText(): string | undefined {
     return editor.document.lineAt(sel.active.line).text.trim() || undefined;
 }
 
+// The line(s) the user selected (or the cursor line), plus two neighbours either side, so the same lines can be
+// found again in another revision and traced by position. Undefined when there is nothing usable to trace.
+function getLineContext(filePath: string): LineContext | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.fsPath !== filePath) return undefined;
+    const sel = editor.selection;
+    const first = sel.start.line;
+    // A selection that ends at column 0 of the next line does not include that line.
+    const last = !sel.isEmpty && sel.end.character === 0 && sel.end.line > first ? sel.end.line - 1 : sel.end.line;
+    if (last - first >= 200) return undefined;
+    const doc = editor.document;
+    const trimmed = (n: number): string => doc.lineAt(n).text.trim();
+    const lines: string[] = [];
+    for (let n = first; n <= last; n++) lines.push(trimmed(n));
+    if (lines.every(l => l === '')) return undefined;
+    const before: string[] = [];
+    for (let n = Math.max(0, first - 2); n < first; n++) before.push(trimmed(n));
+    const after: string[] = [];
+    for (let n = last + 1; n <= Math.min(doc.lineCount - 1, last + 2); n++) after.push(trimmed(n));
+    return { lines, before, after, approxLine: first + 1 };
+}
+
 async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {
     const filePath = getActiveFilePath(uri);
     if (!filePath) {
@@ -38,6 +60,8 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
 
     // Use selected text; if none, let user type it
     let searchText = getSelectedText();
+    // A line taken from the editor is traced by its position; typed text can only be searched for.
+    const lineContext = searchText ? getLineContext(filePath) : undefined;
 
     if (!searchText) {
         searchText = await vscode.window.showInputBox({
@@ -50,10 +74,10 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
 
     if (!searchText?.trim()) return;
 
-    await askBranchAndTrace(context, filePath, searchText.trim());
+    await askBranchAndTrace(context, filePath, searchText.trim(), lineContext);
 }
 
-async function askBranchAndTrace(context: vscode.ExtensionContext, filePath: string, searchText: string): Promise<void> {
+async function askBranchAndTrace(context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext): Promise<void> {
     const branch = await vscode.window.showInputBox({
         title:          'Git Ask: Branch',
         prompt:         'Which branch to trace? (leave blank for all branches)',
@@ -66,7 +90,8 @@ async function askBranchAndTrace(context: vscode.ExtensionContext, filePath: str
         { location: vscode.ProgressLocation.Notification, title: 'Git Ask: tracing...', cancellable: false },
         async () => {
             const intent: Intent = {
-                type:             'FIND_BOTH',
+                type:             lineContext ? 'LINE_HISTORY' : 'FIND_BOTH',
+                lineContext,
                 searchString:     searchText,
                 branch:           branch.trim() || undefined,
                 filePath,

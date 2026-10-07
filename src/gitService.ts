@@ -616,7 +616,10 @@ function traceBlockLoss(
             const parentStates = parents.map(p => stateAt(p, line));
             const key = `${hash}|${line}`;
             if (seen.has(key)) continue;
-            if (mine === 'N' && parentStates.includes('Y')) {
+            // The first parent is the branch the commit was made on / merged into. Only when IT still had the line did this
+            // commit take the line away. A merge whose first parent already lacked the line, and whose other parent is just
+            // an older copy that still has it, changed nothing for the branch it was merged into.
+            if (mine === 'N' && parentStates[0] === 'Y') {
                 seen.add(key);
                 const info = commitInfo(hash, repoRoot);
                 let role: 'dropped' | 'carried' = 'dropped';
@@ -653,10 +656,9 @@ function blockLossNote(loss: { missing: string[]; truncated: boolean }, rev: str
 }
 
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
-    // The "lost here" / "carried in" merges are described by mergeFrom/mergeInto instead of an origin.
-    return commits.map(c => c.removalRole
-        ? c
-        : { ...c, originBranch: getOriginBranch(c.hash, repoRoot, queryBranch) });
+    // Every commit gets its origin branch, including the "lost here" / "carried in" ones; those merges also keep
+    // their mergeFrom/mergeInto ("on X while merging Y"), which the panel shows next to it.
+    return commits.map(c => ({ ...c, originBranch: getOriginBranch(c.hash, repoRoot, queryBranch) }));
 }
 
 export async function executeIntent(intent: Intent): Promise<GitResult> {

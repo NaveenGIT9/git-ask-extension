@@ -622,14 +622,12 @@ function traceBlockLoss(
                 let role: 'dropped' | 'carried' = 'dropped';
                 let note = `Removed "${line}" from this block.`;
                 if (info.parents.length > 1) {
-                    const hadIt = info.parents.filter((_, i) => parentStates[i] === 'Y').map(p => p.slice(0, 7));
-                    const lackedIt = info.parents.filter((_, i) => parentStates[i] !== 'Y').map(p => p.slice(0, 7));
                     const base = mergeBase(info.parents[0], info.parents[1], repoRoot);
                     if (base && stateAt(base, line) === 'Y') {
                         role = 'carried';
-                        note = `Brought in a removal of "${line}" from the other branch (${lackedIt.join(', ')} had already removed it).`;
+                        note = `Brought in a removal of "${line}" from the other branch, where it had already been removed.`;
                     } else {
-                        note = `This merge lost "${line}" from this block: ${hadIt.join(', ')} had it, ${lackedIt.join(', ')} did not, and the merge kept the version without it.`;
+                        note = `This merge lost "${line}" from this block: one side had it, the other never did, and the merge kept the version without it.`;
                     }
                 }
                 entries.push({ ...chainEntry(info, role, note), lines: [`- ${line}`] });

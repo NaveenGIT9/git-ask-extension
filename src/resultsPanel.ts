@@ -49,7 +49,7 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
         const branchLink = (name: string): string => githubBaseUrl
             ? `<a class="origin-branch branch-link" data-url="${githubBaseUrl}/tree/${name.split('/').map(encodeURIComponent).join('/')}" title="Open branch on GitHub">${escapeHtml(name)}</a>`
             : `<span class="origin-branch">${escapeHtml(name)}</span>`;
-        const whereEl = c.removalRole && (c.mergeInto || c.mergeFrom)
+        const whereEl = (c.mergeInto || c.mergeFrom)
             ? `<span class="where">${c.mergeInto ? `<span class="where-label">on</span>${branchLink(c.mergeInto)}` : ''}${c.mergeFrom ? `<span class="where-label">while merging</span>${branchLink(c.mergeFrom)}` : ''}</span>`
             : '';
         const mergeBadge = c.isAutoConflict

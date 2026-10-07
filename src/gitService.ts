@@ -452,7 +452,11 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
 function locateLines(relFile: string, rev: string, ctx: LineContext, repoRoot: string): { start: number; end: number } | undefined {
     let text: string;
     try { text = runArgs(['show', `${rev}:${relFile}`], repoRoot); } catch { return undefined; }
-    const file = text.split(/\r?\n/).map(l => l.trim());
+    return locateInLines(text.split(/\r?\n/).map(l => l.trim()), ctx);
+}
+
+// Same search on the file's (trimmed) lines, so it can run on file text that was read in bulk.
+function locateInLines(file: string[], ctx: LineContext): { start: number; end: number } | undefined {
     const tail = (a: string[], n: number): string[] => (n > 0 ? a.slice(-n) : []);
 
     for (const [b, a] of [[2, 2], [1, 1], [0, 0]]) {
@@ -468,6 +472,62 @@ function locateLines(relFile: string, rev: string, ctx: LineContext, repoRoot: s
         return { start, end: start + ctx.lines.length - 1 };
     }
     return undefined;
+}
+
+// Reads the file at many commits with one `git cat-file --batch` per chunk and reduces each to fn(trimmed lines).
+// A commit where the file does not exist maps to null.
+function scanFileAtCommits<T>(hashes: string[], relFile: string, repoRoot: string, fn: (lines: string[]) => T): Map<string, T | null> {
+    const out = new Map<string, T | null>();
+    for (let i = 0; i < hashes.length; i += 40) {
+        const chunk = hashes.slice(i, i + 40);
+        const r = spawnSync('git', ['cat-file', '--batch'], {
+            cwd: repoRoot, input: chunk.map(h => `${h}:${relFile}\n`).join(''), maxBuffer: 400 * 1024 * 1024,
+        });
+        if (r.error || r.status !== 0 || !r.stdout) continue;
+        const buf = r.stdout;
+        let pos = 0;
+        for (const h of chunk) {
+            const nl = buf.indexOf(10, pos);
+            if (nl < 0) break;
+            const header = buf.toString('utf8', pos, nl);
+            if (header.endsWith(' missing')) { out.set(h, null); pos = nl + 1; continue; }
+            const size = parseInt(header.split(' ')[2], 10);
+            if (Number.isNaN(size)) break;
+            out.set(h, fn(buf.toString('utf8', nl + 1, nl + 1 + size).split(/\r?\n/).map(l => l.trim())));
+            pos = nl + 1 + size + 1;
+        }
+    }
+    return out;
+}
+
+// `git log -L` skips a merge whose lines are identical to one of its parents, so a merge that brought the lines into
+// the branch (first parent lacked them, the merged-in side had them) is invisible there. Find those merges by walking
+// the branch's own (first-parent) history and checking, commit by commit, whether the lines are there.
+function mergesBringingInLines(
+    ctx: LineContext, rev: string, relFile: string, repoRoot: string, depth = 0, seen = new Set<string>(),
+): CommitEntry[] {
+    const listed = runArgs(['rev-list', '--first-parent', '--parents', rev, '--', relFile], repoRoot)
+        .split('\n').map(l => l.trim().split(/\s+/)).filter(p => p[0]).slice(0, 2000);
+    const has = scanFileAtCommits([...new Set(listed.flat())], relFile, repoRoot, lines => locateInLines(lines, ctx) !== undefined);
+    const entries: CommitEntry[] = [];
+    for (const [hash, ...parents] of listed) {
+        if (parents.length < 2 || !has.get(hash) || has.get(parents[0]) || !has.get(parents[1])) continue;
+        if (seen.has(hash)) continue;
+        seen.add(hash);
+        const info = commitInfo(hash, repoRoot);
+        const { src, dst } = parseMergeMessage(info.message);
+        entries.push({
+            hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, author: info.author, message: info.message,
+            action: '+', lines: ctx.lines.map(l => `+ ${l}`), isMerge: true,
+            isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
+            note: 'This merge brought these lines into the branch: the branch it was merged into did not have them yet.',
+            mergeFrom: src, mergeInto: dst,
+        });
+        // The merged-in side got the lines from somewhere too (usually from a merge into its own promotion branch,
+        // then from the feature branch): follow it, so the whole chain feature -> promotion -> branch is listed.
+        if (depth < 6) entries.push(...mergesBringingInLines(ctx, parents[1], relFile, repoRoot, depth + 1, seen));
+    }
+    return entries;
 }
 
 // Parses `git log -L` output: each commit shows only the diff of the traced lines.
@@ -803,9 +863,16 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                     repoRoot
                 );
                 const lineLabel = found.start === found.end ? `Line ${found.start}` : `Lines ${found.start}-${found.end}`;
+                const traced = parseLineLog(raw);
+                let viaMerges: CommitEntry[] = [];
+                try { viaMerges = mergesBringingInLines(ctx, rev, relFile, repoRoot); }
+                catch { /* non-fatal: show the plain trace */ }
+                const known = new Set(traced.map(c => c.hash));
+                const all = [...traced, ...viaMerges.filter(m => !known.has(m.hash))]
+                    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
                 return mk({
-                    commits: enrichWithOriginBranch(parseLineLog(raw), repoRoot, branch),
-                    scopeNote: `${lineLabel} of ${rev} traced by position: only commits that changed these exact lines are shown.`,
+                    commits: enrichWithOriginBranch(all, repoRoot, branch),
+                    scopeNote: `${lineLabel} of ${rev} traced by position: the commits that changed these exact lines, plus the merges that brought them into the branch.`,
                 });
             }
 

@@ -552,7 +552,7 @@ function bestBlockRegion(fileLines: string[], block: string[], approxLine?: numb
  */
 function traceBlockLoss(
     block: string[], rev: string, relFile: string, repoRoot: string, approxLine?: number,
-): { entries: CommitEntry[]; missing: string[]; truncated: boolean } | undefined {
+): { entries: CommitEntry[]; missing: string[]; truncated: boolean; gone?: boolean } | undefined {
     block = block.filter(l => l !== '');   // blank lines cannot anchor a block
     if (block.length < 2) return undefined;
     const regionCache = new Map<string, BlockRegion | null>();
@@ -599,9 +599,9 @@ function traceBlockLoss(
     };
 
     const tipRegion = regionAt(rev);
-    if (!tipRegion) return undefined;
-    const missing = [...new Set(block)].filter(l => l !== '' && stateAt(rev, l) === 'N');
-    if (missing.length === 0) return undefined;
+    const distinctLines = [...new Set(block)];
+    const missing = tipRegion ? distinctLines.filter(l => stateAt(rev, l) === 'N') : distinctLines;
+    if (tipRegion && missing.length === 0) return undefined;   // the block is intact here
 
     const MAX_COMMITS = 2000;
     const listed = runArgs(['rev-list', '--full-history', '--parents', rev, '--', relFile], repoRoot)
@@ -609,6 +609,41 @@ function traceBlockLoss(
     const truncated = listed.length > MAX_COMMITS;
     const commits = listed.slice(0, MAX_COMMITS);
     prefetch([...new Set(commits.flat())]);
+
+    // The whole block is gone from the file at `rev`: use the whole block, not one of its lines. A commit "has" the block
+    // when it is found there (see bestBlockRegion); report where it was added and where it was taken out.
+    if (!tipRegion) {
+        const has = (h: string): boolean => regionAt(h) !== null;
+        const shown = (prefix: string): string[] => {
+            const out = block.slice(0, 12).map(l => `${prefix} ${l}`);
+            return block.length > 12 ? [...out, `${prefix} … ${block.length - 12} more lines`] : out;
+        };
+        const goneEntries: CommitEntry[] = [];
+        for (const [hash, ...parents] of commits) {
+            const mine = has(hash);
+            if (!mine && parents.length > 0 && has(parents[0])) {
+                const info = commitInfo(hash, repoRoot);
+                let role: 'dropped' | 'carried' = 'dropped';
+                let note = 'This commit removed the whole block (or the file).';
+                if (info.parents.length > 1) {
+                    const base = mergeBase(info.parents[0], info.parents[1], repoRoot);
+                    if (base && has(base)) {
+                        role = 'carried';
+                        note = 'Brought in the removal of the whole block from the other branch, where it had already been removed.';
+                    } else {
+                        note = 'This merge lost the whole block: one side had it, the other never did, and the merge kept the version without it.';
+                    }
+                }
+                goneEntries.push({ ...chainEntry(info, role, note), lines: shown('-') });
+            } else if (mine && !parents.some(has)) {
+                const info = commitInfo(hash, repoRoot);
+                goneEntries.push({ ...chainEntry(info, 'carried', 'Added the whole block here.'), action: '+', lines: shown('+'), removalRole: undefined });
+            }
+        }
+        if (goneEntries.length === 0) return undefined;   // the block never existed in this file: nothing to trace as a block
+        goneEntries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+        return { entries: goneEntries, missing: distinctLines, truncated, gone: true };
+    }
 
     const entries: CommitEntry[] = [];
     const seen = new Set<string>();
@@ -650,7 +685,11 @@ function traceBlockLoss(
     return { entries, missing, truncated };
 }
 
-function blockLossNote(loss: { missing: string[]; truncated: boolean }, rev: string): string {
+function blockLossNote(loss: { missing: string[]; truncated: boolean; gone?: boolean }, rev: string): string {
+    if (loss.gone) {
+        return `Your block is no longer in this file on ${rev}. Showing where the whole block was added and where it was removed.` +
+            (loss.truncated ? " Only the most recent 2000 commits of the file were checked." : "");
+    }
     const list = loss.missing.map(l => `"${l}"`).join(', ');
     return `Your block is not exactly as selected on ${rev}: ${loss.missing.length} of its lines ${loss.missing.length === 1 ? 'is' : 'are'} missing (${list}). ` +
         `Showing, inside this block only, where ${loss.missing.length === 1 ? 'it was' : 'they were'} added and where ${loss.missing.length === 1 ? 'it was' : 'they were'} lost.` +

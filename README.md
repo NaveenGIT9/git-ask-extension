@@ -28,7 +28,7 @@ Right-click in the editor (or on a file in the Explorer) and look for the **Git 
 |---|---|
 | **Git Ask: Trace this line's lifecycle (when added / removed)** | Traces the selected line(s) (or the line your cursor is on) **by position**: only commits that changed those exact lines are shown, not every identical line in the file. If the line is not in the file on the branch you pick (for example it was removed), it falls back to searching the text across history and says so at the top of the panel. Text you type yourself is always searched as text. Shows when it was added, removed and re-added, and explains removals made inside merge commits. Shortcut: `Ctrl+Shift+G` then `Ctrl+Shift+T`. |
 | **Git Ask: Full history (incl. merge commits)** | Lists every commit that touched the file, including merge commits that changed it through conflict resolution. |
-| **Git Ask: Trace a line that is no longer in the file (paste it)** | For a line that has been removed and so cannot be selected: paste it, or pick it from your clipboard. |
+| **Git Ask: Trace a line/block which is no longer present** | For a line or block that has been removed (or changed) and so cannot be selected: paste it, or take it from your clipboard. A block is compared with the same block on the branch you pick, and the result shows which of its lines are missing and which commits added and lost them. |
 
 Each trace asks which branch to look at (default `rbkqa`; leave it blank for all branches). A plain name such as `rbkqa` is read as `origin/rbkqa`, so make sure that branch is fetched.
 

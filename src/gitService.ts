@@ -34,6 +34,8 @@ export interface GitResult {
     relativeFile?: string;
     // One line saying how the result was found, e.g. "Line 1855 traced by position on origin/rbkqa".
     scopeNote?: string;
+    // Lines of the traced block that are not in that block on the branch (shown highlighted above the results).
+    missingLines?: string[];
 }
 
 function getGitHubBaseUrl(repoRoot: string): string | undefined {
@@ -693,7 +695,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (intent.blockLines && intent.blockLines.length > 1) {
                     const rev = branch === '--all' ? 'HEAD' : branch;
                     const loss = traceBlockLoss(intent.blockLines, rev, relFile, repoRoot);
-                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev) });
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev), missingLines: loss.missing });
                 }
                 // Pass 1: pickaxe (no -m) — fast, finds direct commits correctly.
                 const args = [
@@ -747,7 +749,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (!found && ctx.lines.length > 1) {
                     // The block is there but not exactly as selected: say which of its lines are missing and who lost them.
                     const loss = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine);
-                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev) });
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev), missingLines: loss.missing });
                 }
                 if (!found) {
                     // The line is not in the file at this revision (removed, or on another branch): the only way to find

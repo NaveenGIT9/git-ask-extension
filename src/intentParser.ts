@@ -144,6 +144,11 @@ export function parseIntent(question: string, activeFilePath?: string): Intent {
 }
 
 export function describeIntent(intent: Intent): string {
+    // A block is described as a block, not by the one line that was used internally to find candidate commits.
+    const blockSize = intent.blockLines?.length ?? 0;
+    if (blockSize > 1 && (intent.type === 'FIND_BOTH' || intent.type === 'FIND_ADDED' || intent.type === 'FIND_REMOVED' || intent.type === 'LINE_HISTORY')) {
+        return `Tracing the history of this ${blockSize}-line block${intent.branch ? ` on ${intent.branch}` : ''}`;
+    }
     switch (intent.type) {
         case 'FIND_ADDED':
             return `Finding when "${intent.searchString}" was ADDED${intent.branch ? ` on ${intent.branch}` : ''}`;

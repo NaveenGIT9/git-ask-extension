@@ -101,6 +101,19 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
             ? `<pre class="raw">${escapeHtml(result.raw.slice(0, 100_000))}</pre>`
             : renderCommits(result.commits ?? [], result.githubBaseUrl);
 
+    // The block the user asked about, shown above the results; lines missing from that block on the branch are marked.
+    const blockLines = (result.intent.blockLines && result.intent.blockLines.length > 1)
+        ? result.intent.blockLines
+        : (result.intent.lineContext && result.intent.lineContext.lines.length > 1 ? result.intent.lineContext.lines : undefined);
+    const missing = new Set(result.missingLines ?? []);
+    const SHOWN = 40;
+    const blockHtml = blockLines
+        ? `<div class="traced-block">
+             <div class="traced-block-title">Block you asked about (${blockLines.length} lines)${missing.size ? ' — <span class="miss-key">highlighted</span> = missing from this block on the branch' : ''}</div>
+             <pre>${blockLines.slice(0, SHOWN).map(l => `<span class="${missing.has(l) ? 'tb-line tb-missing' : 'tb-line'}">${escapeHtml(l)}</span>`).join('\n')}${blockLines.length > SHOWN ? `\n… ${blockLines.length - SHOWN} more lines` : ''}</pre>
+           </div>`
+        : '';
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -117,6 +130,12 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     padding: 16px;
   }
   .header { margin-bottom: 16px; }
+  .traced-block { margin: 0 0 16px; border: 1px solid var(--vscode-panel-border, #444); border-radius: 4px; background: var(--vscode-textBlockQuote-background, #2a2a2a); }
+  .traced-block-title { padding: 6px 10px; font-size: 11px; color: var(--vscode-descriptionForeground, #9d9d9d); border-bottom: 1px solid var(--vscode-panel-border, #444); }
+  .traced-block pre { margin: 0; padding: 8px 10px; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; overflow-x: auto; }
+  .tb-line { display: inline-block; min-width: 100%; }
+  .tb-missing { background: rgba(244, 71, 71, 0.25); color: #f48771; }
+  .miss-key { background: rgba(244, 71, 71, 0.25); color: #f48771; padding: 0 4px; border-radius: 2px; }
   .scope-note { margin-top: 6px; font-size: 12px; color: var(--vscode-descriptionForeground, #9d9d9d); }
   .question {
     font-size: 15px;
@@ -224,6 +243,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
     <div class="file-path">📄 ${escapeHtml(file)}</div>
     ${result.scopeNote ? `<div class="scope-note">${escapeHtml(result.scopeNote)}</div>` : ''}
   </div>
+
+  ${blockHtml}
 
   ${result.commits !== undefined && !result.error
     ? `<div class="count-bar">${count} commit${count !== 1 ? 's' : ''} found</div>`

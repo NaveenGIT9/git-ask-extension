@@ -158,7 +158,7 @@ async function traceRemovedLine(context: vscode.ExtensionContext, uri?: vscode.U
 
     if (!searchText) {
         searchText = await vscode.window.showInputBox({
-            title:          'Git Ask: Trace a line that is no longer in the file',
+            title:          'Git Ask: Trace a line/block which is no longer present',
             prompt:         'Paste the line (or a unique part of it) that was removed',
             placeHolder:    'e.g.  OpportunityObjectTriggerHelper.setMSPDealType(newOppObj, AccountMapTrgInsert);',
             value:          prefill,

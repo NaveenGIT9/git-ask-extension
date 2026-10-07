@@ -494,6 +494,26 @@ function parseLineLog(raw: string): CommitEntry[] {
     return commits;
 }
 
+// For a multi-line block: the search finds commits through one line of it, so check each commit's diff
+// (against its first parent, which also covers merge resolutions) for the other lines and show which ones moved.
+function annotateBlock(commits: CommitEntry[], block: string[], relFile: string, repoRoot: string): CommitEntry[] {
+    const wanted = new Set(block.map(l => l.trim()).filter(Boolean));
+    return commits.map(c => {
+        let patch: string;
+        try { patch = runArgs(['diff', '--no-color', '--unified=0', `${c.hash}^1`, c.hash, '--', relFile], repoRoot); }
+        catch { return c; }   // root commit: no parent to compare with
+        const matched = new Set<string>();
+        for (const l of patch.split('\n')) {
+            const isChange = (l.startsWith('+') && !l.startsWith('+++')) || (l.startsWith('-') && !l.startsWith('---'));
+            if (isChange && wanted.has(l.slice(1).trim())) matched.add(`${l[0]} ${l.slice(1).trim()}`);
+        }
+        if (matched.size === 0) return c;
+        const distinct = new Set([...matched].map(m => m.slice(2))).size;
+        const note = `Touches ${distinct} of the ${wanted.size} distinct lines of your block`;
+        return { ...c, lines: [...matched], note: [c.note, note].filter(Boolean).join(' · ') };
+    });
+}
+
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
     // The "lost here" / "carried in" merges are described by mergeFrom/mergeInto instead of an origin.
     return commits.map(c => c.removalRole
@@ -566,6 +586,9 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                     }
                 }
 
+                if (intent.blockLines && intent.blockLines.length > 1) {
+                    commits = annotateBlock(commits, intent.blockLines, relFile, repoRoot);
+                }
                 return mk({ commits: enrichWithOriginBranch(commits, repoRoot, branch) });
             }
 

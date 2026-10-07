@@ -51,6 +51,19 @@ function getLineContext(filePath: string): LineContext | undefined {
     return { lines, before, after, approxLine: first + 1 };
 }
 
+// The lines of a multi-line editor selection (trimmed, blank lines dropped); undefined for a single line.
+function getSelectedBlock(filePath: string): string[] | undefined {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.fsPath !== filePath || editor.selection.isEmpty) return undefined;
+    const lines = editor.document.getText(editor.selection).split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    return lines.length > 1 ? lines : undefined;
+}
+
+// Header text for the results panel: the line itself, or a short label for a block.
+function questionLabel(searchText: string, block?: string[]): string {
+    return block ? `Block of ${block.length} lines starting "${block[0]}"` : searchText;
+}
+
 async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {
     const filePath = getActiveFilePath(uri);
     if (!filePath) {
@@ -62,6 +75,7 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
     let searchText = getSelectedText();
     // A line taken from the editor is traced by its position; typed text can only be searched for.
     const lineContext = searchText ? getLineContext(filePath) : undefined;
+    const blockLines = searchText ? getSelectedBlock(filePath) : undefined;
 
     if (!searchText) {
         searchText = await vscode.window.showInputBox({
@@ -74,10 +88,12 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
 
     if (!searchText?.trim()) return;
 
-    await askBranchAndTrace(context, filePath, searchText.trim(), lineContext);
+    await askBranchAndTrace(context, filePath, searchText.trim(), lineContext, blockLines);
 }
 
-async function askBranchAndTrace(context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext): Promise<void> {
+async function askBranchAndTrace(
+    context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext, blockLines?: string[],
+): Promise<void> {
     const branch = await vscode.window.showInputBox({
         title:          'Git Ask: Branch',
         prompt:         'Which branch to trace? (leave blank for all branches)',
@@ -92,13 +108,14 @@ async function askBranchAndTrace(context: vscode.ExtensionContext, filePath: str
             const intent: Intent = {
                 type:             lineContext ? 'LINE_HISTORY' : 'FIND_BOTH',
                 lineContext,
+                blockLines,
                 searchString:     searchText,
                 branch:           branch.trim() || undefined,
                 filePath,
                 originalQuestion: searchText,
             };
             const result = await executeIntent(intent);
-            showResults(context, result, searchText);
+            showResults(context, result, questionLabel(searchText, blockLines));
         }
     );
 }
@@ -116,21 +133,27 @@ async function traceRemovedLine(context: vscode.ExtensionContext, uri?: vscode.U
     const clipLines = clipboard.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
 
     const TYPE_MANUALLY = '$(edit) Type or paste a different line...';
+    const WHOLE_BLOCK = `$(list-flat) Trace the whole block (${clipLines.length} lines)`;
     let searchText: string | undefined;
+    let blockLines: string[] | undefined;
     let prefill = clipLines.length === 1 ? clipLines[0] : '';
 
     if (clipLines.length > 1) {
         const picked = await vscode.window.showQuickPick(
-            [...clipLines.map(l => ({ label: l })), { label: TYPE_MANUALLY, alwaysShow: true }],
+            [{ label: WHOLE_BLOCK, alwaysShow: true }, ...clipLines.map(l => ({ label: l })), { label: TYPE_MANUALLY, alwaysShow: true }],
             {
-                title:          'Git Ask: which line from your clipboard did you want to trace?',
-                placeHolder:    'Pick the line that was removed (a longer, more unique line gives better results)',
+                title:          'Git Ask: trace the whole block from your clipboard, or one line of it?',
+                placeHolder:    'Pick the first entry for the whole block, or a single line (a longer, more unique line gives better results)',
                 ignoreFocusOut: true,
             }
         );
         if (!picked) return;
         if (picked.label === TYPE_MANUALLY) prefill = '';
-        else searchText = picked.label;
+        else if (picked.label === WHOLE_BLOCK) {
+            blockLines = clipLines;
+            // The longest line finds the candidate commits; each is then checked against every line of the block.
+            searchText = [...clipLines].sort((a, b) => b.length - a.length)[0];
+        } else searchText = picked.label;
     }
 
     if (!searchText) {
@@ -144,7 +167,7 @@ async function traceRemovedLine(context: vscode.ExtensionContext, uri?: vscode.U
     }
     if (!searchText?.trim()) return;
 
-    await askBranchAndTrace(context, filePath, searchText.trim());
+    await askBranchAndTrace(context, filePath, searchText.trim(), undefined, blockLines);
 }
 
 async function fullHistoryCommand(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {

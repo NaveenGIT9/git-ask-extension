@@ -21,6 +21,9 @@ export interface LineContext {
 export interface Intent {
     type: IntentType;
     lineContext?: LineContext;
+    // When the user gave a multi-line block: all its (trimmed, non-empty) lines. searchString is then the
+    // longest of them, used only to find candidate commits; each commit is then checked against the whole block.
+    blockLines?: string[];
     searchString?: string;
     branch?: string;
     commitHash?: string;

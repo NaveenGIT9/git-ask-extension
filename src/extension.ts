@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as path from 'path';
+import { execFileSync } from 'child_process';
 import { executeIntent } from './gitService';
 import { showResults } from './resultsPanel';
 import { Intent, LineContext } from './intentParser';
@@ -91,15 +93,68 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
     await askBranchAndTrace(context, filePath, searchText.trim(), lineContext, blockLines);
 }
 
+const RECENT_BRANCHES_KEY = 'gitask.recentBranches';
+
+// Remote branch names of the file's repo, without the "origin/" prefix (the same form the trace accepts).
+function listRemoteBranches(filePath: string): string[] {
+    try {
+        const out = execFileSync('git', ['for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin'], {
+            cwd: path.dirname(filePath), encoding: 'utf8', maxBuffer: 50 * 1024 * 1024,
+        });
+        return out.split('\n').map(l => l.trim()).filter(l => l.startsWith('origin/') && l !== 'origin/HEAD').map(l => l.slice('origin/'.length));
+    } catch { return []; }
+}
+
+// A searchable branch list: type "rbk" to narrow it to rbkqa, rbkuat, ... Recently used branches come first, then the
+// environment branches (no slash in the name), then the rest. Any other text typed can still be used as the branch name.
+// Returns '' for all branches and undefined when cancelled.
+async function pickBranch(context: vscode.ExtensionContext, filePath: string, title: string): Promise<string | undefined> {
+    const all = listRemoteBranches(filePath);
+    const recent = context.globalState.get<string[]>(RECENT_BRANCHES_KEY, []).filter(b => all.includes(b));
+    const rest = all.filter(b => !recent.includes(b));
+    const env = rest.filter(b => !b.includes('/')).sort();
+    const other = rest.filter(b => b.includes('/')).sort().reverse();   // newest-looking names (higher numbers) first
+    type Item = vscode.QuickPickItem & { branch: string };
+    const base: Item[] = [
+        { label: '$(repo) All branches', description: 'search every branch', branch: '' },
+        ...(recent.length ? [{ label: 'Recently used', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
+        ...recent.map(b => ({ label: b, branch: b })),
+        ...(env.length ? [{ label: 'Environment branches', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
+        ...env.map(b => ({ label: b, branch: b })),
+        ...(other.length ? [{ label: 'Feature / promotion branches', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
+        ...other.map(b => ({ label: b, branch: b })),
+    ];
+
+    const picked = await new Promise<Item | undefined>(resolve => {
+        const qp = vscode.window.createQuickPick<Item>();
+        qp.title = title;
+        qp.placeholder = 'Type to search branches (for example: rbk)';
+        qp.ignoreFocusOut = true;
+        qp.matchOnDescription = true;
+        qp.items = base;
+        qp.onDidChangeValue(value => {
+            const v = value.trim();
+            // Text that is not a known branch can still be used as typed (a branch that was not fetched, or a ref).
+            qp.items = v && !all.includes(v)
+                ? [...base, { label: `$(search) Use "${v}"`, alwaysShow: true, branch: v }]
+                : base;
+        });
+        qp.onDidAccept(() => { resolve(qp.selectedItems[0]); qp.hide(); });
+        qp.onDidHide(() => { resolve(undefined); qp.dispose(); });
+        qp.show();
+    });
+    if (!picked) return undefined;
+    if (picked.branch) {
+        const updated = [picked.branch, ...recent.filter(b => b !== picked.branch)].slice(0, 5);
+        await context.globalState.update(RECENT_BRANCHES_KEY, updated);
+    }
+    return picked.branch;
+}
+
 async function askBranchAndTrace(
     context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext, blockLines?: string[],
 ): Promise<void> {
-    const branch = await vscode.window.showInputBox({
-        title:          'Git Ask: Branch',
-        prompt:         'Which branch to trace? (leave blank for all branches)',
-        value:          'rbkqa',
-        ignoreFocusOut: true,
-    });
+    const branch = await pickBranch(context, filePath, 'Git Ask: which branch to trace?');
     if (branch === undefined) return;   // cancelled
 
     await vscode.window.withProgress(
@@ -177,12 +232,8 @@ async function fullHistoryCommand(context: vscode.ExtensionContext, uri?: vscode
         return;
     }
 
-    const branch = await vscode.window.showInputBox({
-        title:          'Git Ask: Full History',
-        prompt:         'Branch (leave blank for all branches)',
-        placeHolder:    'e.g. rbkqa',
-        ignoreFocusOut: true,
-    });
+    const branch = await pickBranch(context, filePath, 'Git Ask: full history — which branch?');
+    if (branch === undefined) return;   // cancelled
 
     await vscode.window.withProgress(
         { location: vscode.ProgressLocation.Notification, title: 'Git Ask: loading history...', cancellable: false },

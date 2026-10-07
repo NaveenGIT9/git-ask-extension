@@ -45,7 +45,8 @@ function getGitHubBaseUrl(repoRoot: string): string | undefined {
     try {
         const remote = execSync('git remote get-url origin', { cwd: repoRoot, encoding: 'utf8' }).trim();
         const ssh    = remote.match(/git@github\.com:(.+?)(?:\.git)?$/);
-        const https  = remote.match(/https:\/\/github\.com\/(.+?)(?:\.git)?$/);
+        // The URL may carry credentials ("https://<token>@github.com/..."); only the owner/repo part is used for links.
+        const https  = remote.match(/https:\/\/(?:[^@\/]+@)?github\.com\/(.+?)(?:\.git)?$/);
         const repo   = ssh?.[1] ?? https?.[1];
         return repo ? `https://github.com/${repo}` : undefined;
     } catch { return undefined; }

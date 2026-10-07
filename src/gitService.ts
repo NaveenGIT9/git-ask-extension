@@ -770,7 +770,9 @@ function blockLossNote(loss: { missing: string[]; truncated: boolean; gone?: boo
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
     // Every commit gets its origin branch, including the "lost here" / "carried in" ones; those merges also keep
     // their mergeFrom/mergeInto ("on X while merging Y"), which the panel shows next to it.
-    return commits.map(c => ({ ...c, originBranch: getOriginBranch(c.hash, repoRoot, queryBranch) }));
+    // A merge whose message names its branch ("Merging X to Y") was made on Y, so Y is its origin; the lookup below
+    // would name the next branch that later carried it, which is not where the merge was made.
+    return commits.map(c => ({ ...c, originBranch: c.isMerge && c.mergeInto ? c.mergeInto : getOriginBranch(c.hash, repoRoot, queryBranch) }));
 }
 
 export async function executeIntent(intent: Intent): Promise<GitResult> {

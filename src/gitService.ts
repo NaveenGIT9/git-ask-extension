@@ -514,6 +514,146 @@ function annotateBlock(commits: CommitEntry[], block: string[], relFile: string,
     });
 }
 
+interface BlockRegion { score: number; lines: Set<string> }
+
+// Finds where a block sits in a file: spans that start at a line equal to the block's first line and end at the
+// next line equal to its last, scored by how many of the block's distinct lines they contain. The best span wins.
+// This is what tells apart "<fields>NAME</fields> inside THIS related list" from the same line in all the others.
+function bestBlockRegion(fileLines: string[], block: string[], approxLine?: number): BlockRegion | undefined {
+    const distinct = [...new Set(block)];
+    const first = block[0];
+    const last = block[block.length - 1];
+    const maxSpan = block.length * 3 + 5;
+    let best: (BlockRegion & { start: number }) | undefined;
+    for (let i = 0; i < fileLines.length; i++) {
+        if (fileLines[i] !== first) continue;
+        let j = -1;
+        for (let k = i + 1; k < fileLines.length && k <= i + maxSpan; k++) {
+            if (fileLines[k] === last) { j = k; break; }
+        }
+        if (j < 0) continue;
+        const lines = new Set(fileLines.slice(i, j + 1));
+        const score = distinct.filter(l => lines.has(l)).length;
+        const nearer = best && approxLine !== undefined && Math.abs(i + 1 - approxLine) < Math.abs(best.start + 1 - approxLine);
+        if (!best || score > best.score || (score === best.score && nearer)) best = { score, lines, start: i };
+    }
+    const needed = Math.max(2, Math.ceil(distinct.length * 0.6));
+    return best && best.score >= needed ? { score: best.score, lines: best.lines } : undefined;
+}
+
+/**
+ * For a block that no longer matches the file as it is at `rev`: find which of its lines are missing from the
+ * block there, then walk the file's history and report, inside this block only, where each missing line was
+ * added and where it was lost. Counting the line file-wide would not work: the same line (e.g. <fields>NAME</fields>)
+ * exists in many other blocks, so a merge that drops it here and adds it elsewhere leaves the file-wide count unchanged.
+ * Returns undefined when the block itself cannot be found at `rev`.
+ */
+function traceBlockLoss(
+    block: string[], rev: string, relFile: string, repoRoot: string, approxLine?: number,
+): { entries: CommitEntry[]; missing: string[]; truncated: boolean } | undefined {
+    block = block.filter(l => l !== '');   // blank lines cannot anchor a block
+    if (block.length < 2) return undefined;
+    const regionCache = new Map<string, BlockRegion | null>();
+    const regionAt = (hash: string): BlockRegion | null => {
+        let r = regionCache.get(hash);
+        if (r === undefined) {
+            try {
+                const text = runArgs(['show', `${hash}:${relFile}`], repoRoot);
+                r = bestBlockRegion(text.split(/\r?\n/).map(l => l.trim()), block, approxLine) ?? null;
+            } catch { r = null; }
+            regionCache.set(hash, r);
+        }
+        return r;
+    };
+    // Reading the file at hundreds of commits one `git show` at a time takes minutes; one `cat-file --batch`
+    // process per chunk of revisions is much faster. Each file is reduced to its block region straight away.
+    const prefetch = (hashes: string[]): void => {
+        const todo = hashes.filter(h => !regionCache.has(h));
+        for (let i = 0; i < todo.length; i += 40) {
+            const chunk = todo.slice(i, i + 40);
+            const r = spawnSync('git', ['cat-file', '--batch'], {
+                cwd: repoRoot, input: chunk.map(h => `${h}:${relFile}\n`).join(''), maxBuffer: 400 * 1024 * 1024,
+            });
+            if (r.error || r.status !== 0 || !r.stdout) continue;   // anything not cached is read one at a time later
+            const buf = r.stdout;
+            let pos = 0;
+            for (const h of chunk) {
+                const nl = buf.indexOf(10, pos);
+                if (nl < 0) break;
+                const header = buf.toString('utf8', pos, nl);
+                if (header.endsWith(' missing')) { regionCache.set(h, null); pos = nl + 1; continue; }
+                const size = parseInt(header.split(' ')[2], 10);
+                if (Number.isNaN(size)) break;
+                const text = buf.toString('utf8', nl + 1, nl + 1 + size);
+                regionCache.set(h, bestBlockRegion(text.split(/\r?\n/).map(l => l.trim()), block, approxLine) ?? null);
+                pos = nl + 1 + size + 1;
+            }
+        }
+    };
+    // 'Y' the block holds the line, 'N' the block exists but lacks it, '?' the block is not in that revision
+    const stateAt = (hash: string, line: string): 'Y' | 'N' | '?' => {
+        const r = regionAt(hash);
+        return !r ? '?' : r.lines.has(line) ? 'Y' : 'N';
+    };
+
+    const tipRegion = regionAt(rev);
+    if (!tipRegion) return undefined;
+    const missing = [...new Set(block)].filter(l => l !== '' && stateAt(rev, l) === 'N');
+    if (missing.length === 0) return undefined;
+
+    const MAX_COMMITS = 2000;
+    const listed = runArgs(['rev-list', '--full-history', '--parents', rev, '--', relFile], repoRoot)
+        .split('\n').map(l => l.trim().split(/\s+/)).filter(p => p[0]);
+    const truncated = listed.length > MAX_COMMITS;
+    const commits = listed.slice(0, MAX_COMMITS);
+    prefetch([...new Set(commits.flat())]);
+
+    const entries: CommitEntry[] = [];
+    const seen = new Set<string>();
+    for (const line of missing) {
+        for (const [hash, ...parents] of commits) {
+            const mine = stateAt(hash, line);
+            const parentStates = parents.map(p => stateAt(p, line));
+            const key = `${hash}|${line}`;
+            if (seen.has(key)) continue;
+            if (mine === 'N' && parentStates.includes('Y')) {
+                seen.add(key);
+                const info = commitInfo(hash, repoRoot);
+                let role: 'dropped' | 'carried' = 'dropped';
+                let note = `Removed "${line}" from this block.`;
+                if (info.parents.length > 1) {
+                    const hadIt = info.parents.filter((_, i) => parentStates[i] === 'Y').map(p => p.slice(0, 7));
+                    const lackedIt = info.parents.filter((_, i) => parentStates[i] !== 'Y').map(p => p.slice(0, 7));
+                    const base = mergeBase(info.parents[0], info.parents[1], repoRoot);
+                    if (base && stateAt(base, line) === 'Y') {
+                        role = 'carried';
+                        note = `Brought in a removal of "${line}" from the other branch (${lackedIt.join(', ')} had already removed it).`;
+                    } else {
+                        note = `This merge lost "${line}" from this block: ${hadIt.join(', ')} had it, ${lackedIt.join(', ')} did not, and the merge kept the version without it.`;
+                    }
+                }
+                entries.push({ ...chainEntry(info, role, note), lines: [`- ${line}`] });
+            } else if (mine === 'Y' && !parentStates.includes('Y')) {
+                seen.add(key);
+                const info = commitInfo(hash, repoRoot);
+                entries.push({
+                    ...chainEntry(info, 'carried', `Added "${line}" to this block.`),
+                    action: '+', lines: [`+ ${line}`], removalRole: undefined,
+                });
+            }
+        }
+    }
+    entries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    return { entries, missing, truncated };
+}
+
+function blockLossNote(loss: { missing: string[]; truncated: boolean }, rev: string): string {
+    const list = loss.missing.map(l => `"${l}"`).join(', ');
+    return `Your block is not exactly as selected on ${rev}: ${loss.missing.length} of its lines ${loss.missing.length === 1 ? 'is' : 'are'} missing (${list}). ` +
+        `Showing, inside this block only, where ${loss.missing.length === 1 ? 'it was' : 'they were'} added and where ${loss.missing.length === 1 ? 'it was' : 'they were'} lost.` +
+        (loss.truncated ? ' Only the most recent 2000 commits of the file were checked.' : '');
+}
+
 function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryBranch: string): CommitEntry[] {
     // The "lost here" / "carried in" merges are described by mergeFrom/mergeInto instead of an origin.
     return commits.map(c => c.removalRole
@@ -548,6 +688,12 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
             case 'SEARCH_ALL_BRANCHES': {
                 if (!intent.searchString) {
                     return err('Could not detect what to search for. Try: "when was RAMP_EXIT_RBOB added"');
+                }
+                // A pasted block that is still partly in the file: trace its missing lines inside that block.
+                if (intent.blockLines && intent.blockLines.length > 1) {
+                    const rev = branch === '--all' ? 'HEAD' : branch;
+                    const loss = traceBlockLoss(intent.blockLines, rev, relFile, repoRoot);
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev) });
                 }
                 // Pass 1: pickaxe (no -m) — fast, finds direct commits correctly.
                 const args = [
@@ -598,6 +744,11 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 // `git log -L` needs one concrete revision; with no branch given use what is checked out.
                 const rev = branch === '--all' ? 'HEAD' : branch;
                 const found = locateLines(relFile, rev, ctx, repoRoot);
+                if (!found && ctx.lines.length > 1) {
+                    // The block is there but not exactly as selected: say which of its lines are missing and who lost them.
+                    const loss = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine);
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev) });
+                }
                 if (!found) {
                     // The line is not in the file at this revision (removed, or on another branch): the only way to find
                     // it is by its text, which also matches every identical line in the file.

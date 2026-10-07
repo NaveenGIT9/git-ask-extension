@@ -22,6 +22,9 @@ export interface CommitEntry {
     // merging mergeFrom in; it is not an "origin" of the change.
     mergeInto?: string;
     mergeFrom?: string;
+    // For a merge that brought the traced lines into a branch: 'merged-in' = the lines were written on the merged-in
+    // branch; 'carried-over' = that branch already had them from an earlier merge and this one passed them on.
+    mergeStep?: 'merged-in' | 'carried-over';
 }
 
 export interface GitResult {
@@ -531,6 +534,7 @@ function mergesBringingInLines(
             action: '+', lines: ctx.lines.map(l => `+ ${l}`), isMerge: true,
             isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
             note, mergeFrom: src, mergeInto: dst,
+            mergeStep: earlier.length === 0 ? 'merged-in' : 'carried-over',
         });
         entries.push(...earlier);
     }

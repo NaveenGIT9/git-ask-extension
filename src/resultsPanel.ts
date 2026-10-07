@@ -68,7 +68,11 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
         return `
         <div class="${commitClass}">
             <div class="commit-header">
-                ${actionBadge(c.action)}
+                ${c.mergeStep === 'carried-over'
+                    ? `<span class="badge carried-over-badge">↳ CARRIED OVER</span>`
+                    : c.mergeStep === 'merged-in'
+                    ? `<span class="badge merged-in-badge">⇄ MERGED IN</span>`
+                    : actionBadge(c.action)}
                 ${roleBadge}
                 ${mergeBadge}
                 <span class="date">${escapeHtml(formatDate(c.date))}</span>
@@ -213,6 +217,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   .badge.auto-conflict { background: #4a2e00; color: #e0a000; border: 1px solid #7a5000; }
   .badge.merge-badge   { background: #1a2a4a; color: #5a9aff; border: 1px solid #2a4a7a; }
   .badge.dropped-badge { background: #5a1a1a; color: #ff8a8a; border: 1px solid #a03a3a; }
+  .badge.merged-in-badge   { background: #14323f; color: #4fc1ff; border: 1px solid #1f5a73; }
+  .badge.carried-over-badge { background: #2a2a4a; color: #a9a9ff; border: 1px solid #4a4a8a; }
   .badge.carried-badge { background: #4a2e00; color: #e0a000; border: 1px solid #7a5000; }
   .date   { color: var(--vscode-descriptionForeground, #858585); font-size: 12px; }
   .hash   { background: var(--vscode-textBlockQuote-background, #333); padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #ce9178; font-family: monospace; }

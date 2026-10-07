@@ -516,16 +516,23 @@ function mergesBringingInLines(
         seen.add(hash);
         const info = commitInfo(hash, repoRoot);
         const { src, dst } = parseMergeMessage(info.message);
+        // The merged-in side got the lines from somewhere too (usually from a merge into its own promotion branch,
+        // then from the feature branch): follow it, so the whole chain feature -> promotion -> branch is listed.
+        const earlier = depth < 6 ? mergesBringingInLines(ctx, parents[1], relFile, repoRoot, depth + 1, seen) : [];
+        const from = src ?? 'the other branch';
+        const into = dst ?? 'this branch';
+        // No earlier merge: the lines were written on the merged-in branch itself and this merge brought them over.
+        // With an earlier merge: the merged-in branch already had them from a merge of its own; this merge only carried them on.
+        const note = earlier.length === 0
+            ? `Merged ${from} into ${into}. The lines were written on ${from}; ${into} did not have them before this merge.`
+            : `Carried over from ${from} into ${into}. ${from} already had these lines (they reached it through an earlier merge); ${into} did not have them before this merge.`;
         entries.push({
             hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, author: info.author, message: info.message,
             action: '+', lines: ctx.lines.map(l => `+ ${l}`), isMerge: true,
             isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
-            note: 'This merge brought these lines into the branch: the branch it was merged into did not have them yet.',
-            mergeFrom: src, mergeInto: dst,
+            note, mergeFrom: src, mergeInto: dst,
         });
-        // The merged-in side got the lines from somewhere too (usually from a merge into its own promotion branch,
-        // then from the feature branch): follow it, so the whole chain feature -> promotion -> branch is listed.
-        if (depth < 6) entries.push(...mergesBringingInLines(ctx, parents[1], relFile, repoRoot, depth + 1, seen));
+        entries.push(...earlier);
     }
     return entries;
 }

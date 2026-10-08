@@ -22,6 +22,8 @@ export interface CommitEntry {
     // merging mergeFrom in; it is not an "origin" of the change.
     mergeInto?: string;
     mergeFrom?: string;
+    // The commit's exact time (Unix seconds), used only to order entries; the panel shows just the date.
+    ts?: number;
     // For a merge that brought the traced lines into a branch: 'merged-in' = the lines were written on the merged-in
     // branch; 'carried-over' = that branch already had them from an earlier merge and this one passed them on.
     mergeStep?: 'merged-in' | 'carried-over';
@@ -39,6 +41,8 @@ export interface GitResult {
     scopeNote?: string;
     // Lines of the traced block that are not in that block on the branch (shown highlighted above the results).
     missingLines?: string[];
+    // The line the user asked about when a block only served to identify it (see Intent.focusLine).
+    focusLine?: string;
 }
 
 function getGitHubBaseUrl(repoRoot: string): string | undefined {
@@ -141,6 +145,14 @@ function isAncestor(ancestor: string, descendant: string, repoRoot: string): boo
     return spawnSync('git', ['merge-base', '--is-ancestor', ancestor, descendant], { cwd: repoRoot }).status === 0;
 }
 
+// Orders entries newest first by the commit's exact time. Several commits often share a day, and a merge must come after
+// the commits it merges, so the date alone is not enough. At the very same second a merge counts as newer than a plain commit.
+function byNewest(a: CommitEntry, b: CommitEntry): number {
+    if (a.ts && b.ts && a.ts !== b.ts) return b.ts - a.ts;
+    if (a.date !== b.date) return a.date < b.date ? 1 : -1;
+    return (a.isMerge ? 0 : 1) - (b.isMerge ? 0 : 1);   // newest first: a merge goes before the commits it merges
+}
+
 function parsePickaxeOutput(raw: string, searchString: string): CommitEntry[] {
     const commits: CommitEntry[] = [];
     let current: CommitEntry | null = null;
@@ -149,11 +161,12 @@ function parsePickaxeOutput(raw: string, searchString: string): CommitEntry[] {
     for (const line of raw.split('\n')) {
         if (line.startsWith('COMMIT_MARKER:')) {
             if (current) commits.push(current);
-            const [hash, date, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
+            const [hash, date, ct, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
             current = {
                 hash: hash.trim(),
                 shortHash: hash.trim().slice(0, 7),
                 date: date.trim(),
+                ts: Number(ct) || undefined,
                 author: author.trim(),
                 message: msg.join('|').trim(),
                 lines: [],
@@ -196,35 +209,6 @@ function parseLogOutput(raw: string): CommitEntry[] {
         });
 }
 
-// Parses output from `git log -m --format=COMMIT_MARKER:%H|%P|%ad|%an|%s ...`.
-// -m causes each merge commit to appear once per parent, so we deduplicate by hash.
-// %P (parent hashes, space-separated) lets us tag merge commits and auto-conflict merges.
-function parseLogOutputWithMerges(raw: string): CommitEntry[] {
-    const seen = new Set<string>();
-    const commits: CommitEntry[] = [];
-    for (const line of raw.split('\n')) {
-        if (!line.startsWith('COMMIT_MARKER:')) continue;
-        const data = line.slice('COMMIT_MARKER:'.length);
-        const [hash, parentsRaw, date, author, ...msgParts] = data.split('|');
-        const h = hash.trim();
-        if (!h || seen.has(h)) continue;
-        seen.add(h);
-        const parents = parentsRaw.trim().split(/\s+/).filter(Boolean);
-        const message = msgParts.join('|').trim();
-        const isMerge = parents.length > 1;
-        commits.push({
-            hash: h,
-            shortHash: h.slice(0, 7),
-            date: date.trim(),
-            author: author.trim(),
-            message,
-            isMerge,
-            isAutoConflict: isMerge && message.toLowerCase().includes('auto conflict'),
-        });
-    }
-    return commits;
-}
-
 function fileHasString(hash: string, relFile: string, searchString: string, repoRoot: string): boolean {
     const r = spawnSync('git', ['show', `${hash}:${relFile}`],
         { encoding: 'utf8', cwd: repoRoot, maxBuffer: 5 * 1024 * 1024 });
@@ -244,7 +228,7 @@ function findHiddenRemovals(
     repoRoot: string,
 ): CommitEntry[] {
     // Work chronologically (oldest first)
-    const chrono = [...commits].sort((a, b) => a.date < b.date ? -1 : 1);
+    const chrono = [...commits].sort((a, b) => byNewest(b, a));
     const result: CommitEntry[] = [];
 
     for (let i = 0; i < chrono.length - 1; i++) {
@@ -257,14 +241,14 @@ function findHiddenRemovals(
         // Newest first — we'll reverse below.
         const rangeArgs = [
             'log', '--full-history', branch,
-            '--format=%H|%ad|%an|%s', '--date=format:%Y-%m-%d',
+            '--format=%H|%ad|%ct|%an|%s', '--date=format:%Y-%m-%d',
             `--after=${earlier.date}`, `--before=${later.date}`,
             '--', relFile,
         ];
         const rangeOut = runArgs(rangeArgs, repoRoot);
         const entries = rangeOut.split('\n').filter(l => l.trim()).map(line => {
-            const [hash, date, author, ...msg] = line.split('|');
-            return { hash: hash.trim(), date, author, message: msg.join('|').trim() };
+            const [hash, date, ct, author, ...msg] = line.split('|');
+            return { hash: hash.trim(), date, ts: Number(ct) || undefined, author, message: msg.join('|').trim() };
         }).reverse(); // chronological order
 
         if (entries.length === 0) continue;
@@ -290,6 +274,7 @@ function findHiddenRemovals(
             hash:      e.hash,
             shortHash: e.hash.slice(0, 7),
             date:      e.date,
+            ts:        e.ts,
             author:    e.author,
             message:   e.message,
             action:    '-',
@@ -304,20 +289,22 @@ interface CommitInfo {
     hash: string;
     parents: string[];
     date: string;
+    ts?: number;
     author: string;
     message: string;
 }
 
 function commitInfo(hash: string, repoRoot: string): CommitInfo {
     const out = runArgs(
-        ['show', '-s', '--format=%H|%P|%ad|%an|%s', '--date=format:%Y-%m-%d', hash],
+        ['show', '-s', '--format=%H|%P|%ad|%ct|%an|%s', '--date=format:%Y-%m-%d', hash],
         repoRoot
     ).trim();
-    const [h, parentsRaw, date, author, ...msg] = out.split('|');
+    const [h, parentsRaw, date, ct, author, ...msg] = out.split('|');
     return {
         hash:    h.trim(),
         parents: parentsRaw.trim().split(/\s+/).filter(Boolean),
         date:    date.trim(),
+        ts:      Number(ct) || undefined,
         author:  author.trim(),
         message: msg.join('|').trim(),
     };
@@ -354,6 +341,7 @@ function chainEntry(info: CommitInfo, role: 'dropped' | 'carried', note: string)
         hash:           info.hash,
         shortHash:      info.hash.slice(0, 7),
         date:           info.date,
+        ts:             info.ts,
         author:         info.author,
         message:        info.message,
         action:         '-',
@@ -453,6 +441,13 @@ function traceRemovalChain(searchString: string, branch: string, relFile: string
 // Finds where the selected line(s) sit in the file as it is at `rev`. The editor may be showing unsaved edits or
 // a different branch, so the editor's line number is only a hint: the lines are matched by content plus the
 // neighbouring lines, widest context first, and the candidate closest to the editor's line wins.
+// How many lines of the file at `rev` have exactly this (trimmed) text; 0 when the file is not there.
+function countLineInFile(relFile: string, rev: string, line: string, repoRoot: string): number {
+    try {
+        return runArgs(['show', `${rev}:${relFile}`], repoRoot).split(/\r?\n/).filter(l => l.trim() === line).length;
+    } catch { return 0; }
+}
+
 function locateLines(relFile: string, rev: string, ctx: LineContext, repoRoot: string): { start: number; end: number } | undefined {
     let text: string;
     try { text = runArgs(['show', `${rev}:${relFile}`], repoRoot); } catch { return undefined; }
@@ -531,7 +526,7 @@ function mergesBringingInLines(
             ? `Merged ${from} into ${into}. The lines were written on ${from}; ${into} did not have them before this merge.`
             : `Carried over from ${from} into ${into}. ${from} already had these lines (they reached it through an earlier merge); ${into} did not have them before this merge.`;
         entries.push({
-            hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, author: info.author, message: info.message,
+            hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, ts: info.ts, author: info.author, message: info.message,
             action: '+', lines: ctx.lines.map(l => `+ ${l}`), isMerge: true,
             isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
             note, mergeFrom: src, mergeInto: dst,
@@ -549,8 +544,8 @@ function parseLineLog(raw: string): CommitEntry[] {
     for (const line of raw.split('\n')) {
         if (line.startsWith('COMMIT_MARKER:')) {
             if (current) commits.push(current);
-            const [hash, date, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
-            current = { hash: hash.trim(), shortHash: hash.trim().slice(0, 7), date: date.trim(), author: author.trim(), message: msg.join('|').trim(), lines: [] };
+            const [hash, date, ct, author, ...msg] = line.replace('COMMIT_MARKER:', '').split('|');
+            current = { hash: hash.trim(), shortHash: hash.trim().slice(0, 7), date: date.trim(), ts: Number(ct) || undefined, author: author.trim(), message: msg.join('|').trim(), lines: [] };
             continue;
         }
         if (!current) continue;
@@ -624,16 +619,26 @@ function bestBlockRegion(fileLines: string[], block: string[], approxLine?: numb
  */
 function traceBlockLoss(
     block: string[], rev: string, relFile: string, repoRoot: string, approxLine?: number,
+    opts: { wholeFile?: boolean; focus?: string } = {},
 ): { entries: CommitEntry[]; missing: string[]; truncated: boolean; gone?: boolean } | undefined {
     block = block.filter(l => l !== '');   // blank lines cannot anchor a block
-    if (block.length < 2) return undefined;
+    // wholeFile: one line whose text is unique in the file. A commit "has" the line when that exact text is anywhere in
+    // the file, so no block position is involved and line numbers do not matter.
+    const wholeFile = opts.wholeFile === true;
+    if (block.length < (wholeFile ? 1 : 2)) return undefined;
+    const where = wholeFile ? 'this file' : 'this block';
+    const regionOf = (lines: string[]): BlockRegion | null => {
+        if (!wholeFile) return bestBlockRegion(lines, block, approxLine) ?? null;
+        const inFile = new Set(lines);
+        return { score: 1, lines: new Set(block.filter(l => inFile.has(l))) };   // only the lines of interest are kept
+    };
     const regionCache = new Map<string, BlockRegion | null>();
     const regionAt = (hash: string): BlockRegion | null => {
         let r = regionCache.get(hash);
         if (r === undefined) {
             try {
                 const text = runArgs(['show', `${hash}:${relFile}`], repoRoot);
-                r = bestBlockRegion(text.split(/\r?\n/).map(l => l.trim()), block, approxLine) ?? null;
+                r = regionOf(text.split(/\r?\n/).map(l => l.trim()));
             } catch { r = null; }
             regionCache.set(hash, r);
         }
@@ -659,7 +664,7 @@ function traceBlockLoss(
                 const size = parseInt(header.split(' ')[2], 10);
                 if (Number.isNaN(size)) break;
                 const text = buf.toString('utf8', nl + 1, nl + 1 + size);
-                regionCache.set(h, bestBlockRegion(text.split(/\r?\n/).map(l => l.trim()), block, approxLine) ?? null);
+                regionCache.set(h, regionOf(text.split(/\r?\n/).map(l => l.trim())));
                 pos = nl + 1 + size + 1;
             }
         }
@@ -672,8 +677,13 @@ function traceBlockLoss(
 
     const tipRegion = regionAt(rev);
     const distinctLines = [...new Set(block)];
-    const missing = tipRegion ? distinctLines.filter(l => stateAt(rev, l) === 'N') : distinctLines;
-    if (tipRegion && missing.length === 0) return undefined;   // the block is intact here
+    if (wholeFile && !tipRegion) return undefined;   // the file itself is not at this revision
+    // focus: one line inside the block. The block only says which copy is meant; that line's whole life inside the block is wanted.
+    const focus = opts.focus && distinctLines.includes(opts.focus) ? opts.focus : undefined;
+    if (focus && !tipRegion) return undefined;       // the block is not at this revision, so there is no copy to follow
+    // In whole-file mode the line's whole life is wanted, whether or not it is in the file now.
+    const missing = focus ? [focus] : wholeFile ? distinctLines : tipRegion ? distinctLines.filter(l => stateAt(rev, l) === 'N') : distinctLines;
+    if (!wholeFile && !focus && tipRegion && missing.length === 0) return undefined;   // the block is intact here
 
     const MAX_COMMITS = 2000;
     const listed = runArgs(['rev-list', '--full-history', '--parents', rev, '--', relFile], repoRoot)
@@ -681,6 +691,28 @@ function traceBlockLoss(
     const truncated = listed.length > MAX_COMMITS;
     const commits = listed.slice(0, MAX_COMMITS);
     prefetch([...new Set(commits.flat())]);
+
+    // Merges that brought the line(s) or the block into the branch: the branch the merge went into (first parent) did not
+    // have them, the merged-in side (second parent) did. "Carried over" when that side itself got them through an earlier
+    // merge; "merged in" when they were written on that side. (`git log` alone hides these merges, as in the selection trace.)
+    const mergeInEntries = (isIn: (hash: string) => boolean, what: string, pronoun: string, lines: string[]): CommitEntry[] => {
+        const candidates = commits.filter(([h, ...p]) => p.length > 1 && isIn(h) && !isIn(p[0]) && isIn(p[1]));
+        return candidates.map(([hash, ...parents]) => {
+            const info = commitInfo(hash, repoRoot);
+            const { src, dst } = parseMergeMessage(info.message);
+            const carried = candidates.some(([other]) => other !== hash && isAncestor(other, parents[1], repoRoot));
+            const from = src ?? 'the other branch';
+            const into = dst ?? 'this branch';
+            const note = carried
+                ? `Carried over from ${from} into ${into}. ${from} already had ${what} (they reached it through an earlier merge); ${into} did not have ${pronoun} before this merge.`
+                : `Merged ${from} into ${into}. ${what} came from ${from}; ${into} did not have ${pronoun} before this merge.`;
+            return {
+                hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, ts: info.ts, author: info.author, message: info.message,
+                action: '+' as const, lines, isMerge: true, isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
+                note, mergeFrom: src, mergeInto: dst, mergeStep: carried ? ('carried-over' as const) : ('merged-in' as const),
+            };
+        });
+    };
 
     // The whole block is gone from the file at `rev`: use the whole block, not one of its lines. A commit "has" the block
     // when it is found there (see bestBlockRegion); report where it was added and where it was taken out.
@@ -712,8 +744,9 @@ function traceBlockLoss(
                 goneEntries.push({ ...chainEntry(info, 'carried', 'Added the whole block here.'), action: '+', lines: shown('+'), removalRole: undefined });
             }
         }
+        goneEntries.push(...mergeInEntries(has, 'The block', 'it', shown('+')));
         if (goneEntries.length === 0) return undefined;   // the block never existed in this file: nothing to trace as a block
-        goneEntries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+        goneEntries.sort(byNewest);
         return { entries: goneEntries, missing: distinctLines, truncated, gone: true };
     }
 
@@ -732,14 +765,14 @@ function traceBlockLoss(
                 seen.add(key);
                 const info = commitInfo(hash, repoRoot);
                 let role: 'dropped' | 'carried' = 'dropped';
-                let note = `Removed "${line}" from this block.`;
+                let note = `Removed "${line}" from ${where}.`;
                 if (info.parents.length > 1) {
                     const base = mergeBase(info.parents[0], info.parents[1], repoRoot);
                     if (base && stateAt(base, line) === 'Y') {
                         role = 'carried';
                         note = `Brought in a removal of "${line}" from the other branch, where it had already been removed.`;
                     } else {
-                        note = `This merge lost "${line}" from this block: one side had it, the other never did, and the merge kept the version without it.`;
+                        note = `This merge lost "${line}" from ${where}: one side had it, the other never did, and the merge kept the version without it.`;
                     }
                 }
                 entries.push({ ...chainEntry(info, role, note), lines: [`- ${line}`] });
@@ -747,13 +780,23 @@ function traceBlockLoss(
                 seen.add(key);
                 const info = commitInfo(hash, repoRoot);
                 entries.push({
-                    ...chainEntry(info, 'carried', `Added "${line}" to this block.`),
+                    ...chainEntry(info, 'carried', `Added "${line}" to ${where}.`),
                     action: '+', lines: [`+ ${line}`], removalRole: undefined,
                 });
             }
         }
     }
-    entries.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+    // Merges that brought a missing line into the branch; one entry per merge, listing every line it brought in.
+    const mergedIn = new Map<string, CommitEntry>();
+    for (const line of missing) {
+        for (const e of mergeInEntries((h) => stateAt(h, line) === 'Y', 'The line', 'it', [`+ ${line}`])) {
+            const existing = mergedIn.get(e.hash);
+            if (existing) existing.lines = [...(existing.lines ?? []), ...(e.lines ?? [])];
+            else mergedIn.set(e.hash, e);
+        }
+    }
+    entries.push(...mergedIn.values());
+    entries.sort(byNewest);
     return { entries, missing, truncated };
 }
 
@@ -814,7 +857,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 const args = [
                     'log', `-S${intent.searchString}`,
                     '--full-history', branch, '-p',
-                    '--format=COMMIT_MARKER:%H|%ad|%an|%s',
+                    '--format=COMMIT_MARKER:%H|%ad|%ct|%an|%s',
                     '--date=format:%Y-%m-%d',
                     '--', relFile,
                 ];
@@ -827,7 +870,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                     const hidden = findHiddenRemovals(intent.searchString, commits, branch, relFile, repoRoot);
                     commits = [...commits, ...hidden];
                     // Re-sort newest first
-                    commits.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+                    commits.sort(byNewest);
                 }
 
                 if (intent.type === 'FIND_ADDED')   commits = commits.filter(c => c.action === '+');
@@ -843,7 +886,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                         const chainHashes = new Set(chain.map(c => c.hash));
                         commits = [...chain, ...commits.filter(c => !chainHashes.has(c.hash))];
                         // Stable sort: equal dates keep the chain order (carried merge before dropping merge)
-                        commits.sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+                        commits.sort(byNewest);
                     }
                 }
 
@@ -858,6 +901,38 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (!ctx || ctx.lines.length === 0) return err('No line selected.');
                 // `git log -L` needs one concrete revision; with no branch given use what is checked out.
                 const rev = branch === '--all' ? 'HEAD' : branch;
+                // The user selected one repeated line and then let Git Ask widen the selection to its block: the block only
+                // identifies which copy was meant, so show that line's history inside that block.
+                if (intent.focusLine && ctx.lines.length > 1) {
+                    const life = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine, { focus: intent.focusLine });
+                    if (life && life.entries.length > 0) {
+                        return mk({
+                            commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
+                            focusLine: intent.focusLine,
+                            scopeNote: `Tracing the line you selected, ${intent.focusLine}, inside the block around it on ${rev}. The block only identifies which copy you meant: ` +
+                                `the history below is that line's (when it was added, merged in, removed).` + (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
+                        });
+                    }
+                }
+                // One selected line whose text appears only once in the file: its position tells nothing (other lines are
+                // inserted, edited and reordered around it all the time), so trace its content instead.
+                const copies = ctx.lines.length === 1 && ctx.lines[0] !== '' ? countLineInFile(relFile, rev, ctx.lines[0], repoRoot) : 0;
+                // A line that sits in several places cannot be traced reliably (by position the answer would be about whatever
+                // else happened to be at that line number), so ask for a block instead of guessing.
+                if (copies > 1) {
+                    return err(`This line appears ${copies} times in the file on ${rev}, so Git Ask cannot tell which one you mean. ` +
+                        `Select the whole block it belongs to (for example from <relatedLists> to </relatedLists>), or add a few lines around it, and trace again.`);
+                }
+                if (copies === 1) {
+                    const life = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine, { wholeFile: true });
+                    if (life && life.entries.length > 0) {
+                        return mk({
+                            commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
+                            scopeNote: `This line's text appears once in the file on ${rev}, so it was traced by its content (line numbers do not matter): ` +
+                                `where it was added, removed and merged in.` + (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
+                        });
+                    }
+                }
                 const found = locateLines(relFile, rev, ctx, repoRoot);
                 if (!found && ctx.lines.length > 1) {
                     // The block is there but not exactly as selected: say which of its lines are missing and who lost them.
@@ -873,7 +948,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 }
                 const range = found.start === found.end ? `${found.start}` : `${found.start},${found.end}`;
                 const raw = runArgs(
-                    ['log', `-L${range}:${relFile}`, rev, '--format=COMMIT_MARKER:%H|%ad|%an|%s', '--date=format:%Y-%m-%d'],
+                    ['log', `-L${range}:${relFile}`, rev, '--format=COMMIT_MARKER:%H|%ad|%ct|%an|%s', '--date=format:%Y-%m-%d'],
                     repoRoot
                 );
                 const lineLabel = found.start === found.end ? `Line ${found.start}` : `Lines ${found.start}-${found.end}`;
@@ -883,25 +958,11 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 catch { /* non-fatal: show the plain trace */ }
                 const known = new Set(traced.map(c => c.hash));
                 const all = [...traced, ...viaMerges.filter(m => !known.has(m.hash))]
-                    .sort((a, b) => (a.date < b.date ? 1 : a.date > b.date ? -1 : 0));
+                    .sort(byNewest);
                 return mk({
                     commits: enrichWithOriginBranch(all, repoRoot, branch),
                     scopeNote: `${lineLabel} of ${rev} traced by position: the commits that changed these exact lines, plus the merges that brought them into the branch.`,
                 });
-            }
-
-            case 'FULL_HISTORY': {
-                // -m exposes merge commits that silently changed the file via conflict
-                // resolution — these are invisible to standard git log without this flag.
-                const args = [
-                    'log', '--full-history', '-m', branch,
-                    '--format=COMMIT_MARKER:%H|%P|%ad|%an|%s',
-                    '--date=format:%Y-%m-%d',
-                    '--', relFile,
-                ];
-                const raw = runArgs(args, repoRoot);
-                const commits = parseLogOutputWithMerges(raw);
-                return mk({ commits: enrichWithOriginBranch(commits, repoRoot, branch) });
             }
 
             case 'RECENT_HISTORY': {

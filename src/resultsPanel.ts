@@ -110,11 +110,16 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
         ? result.intent.blockLines
         : (result.intent.lineContext && result.intent.lineContext.lines.length > 1 ? result.intent.lineContext.lines : undefined);
     const missing = new Set(result.missingLines ?? []);
+    const focus = result.focusLine;
     const SHOWN = 40;
+    const blockTitle = focus
+        ? `Block around your line (${blockLines?.length ?? 0} lines): it only identifies which copy you meant. <span class="focus-key">Highlighted</span> = the line being traced`
+        : `Block you asked about (${blockLines?.length ?? 0} lines)${missing.size ? ' — <span class="miss-key">highlighted</span> = missing from this block on the branch' : ''}`;
+    const lineClass = (l: string): string => (focus && l === focus ? 'tb-line tb-focus' : missing.has(l) ? 'tb-line tb-missing' : 'tb-line');
     const blockHtml = blockLines
         ? `<div class="traced-block">
-             <div class="traced-block-title">Block you asked about (${blockLines.length} lines)${missing.size ? ' — <span class="miss-key">highlighted</span> = missing from this block on the branch' : ''}</div>
-             <pre>${blockLines.slice(0, SHOWN).map(l => `<span class="${missing.has(l) ? 'tb-line tb-missing' : 'tb-line'}">${escapeHtml(l)}</span>`).join('\n')}${blockLines.length > SHOWN ? `\n… ${blockLines.length - SHOWN} more lines` : ''}</pre>
+             <div class="traced-block-title">${blockTitle}</div>
+             <pre>${blockLines.slice(0, SHOWN).map(l => `<span class="${lineClass(l)}">${escapeHtml(l)}</span>`).join('\n')}${blockLines.length > SHOWN ? `\n… ${blockLines.length - SHOWN} more lines` : ''}</pre>
            </div>`
         : '';
 
@@ -139,6 +144,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   .traced-block pre { margin: 0; padding: 8px 10px; font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; overflow-x: auto; }
   .tb-line { display: inline-block; min-width: 100%; }
   .tb-missing { background: rgba(244, 71, 71, 0.25); color: #f48771; }
+  .tb-focus { background: rgba(79, 193, 255, 0.22); color: #4fc1ff; font-weight: 600; }
+  .focus-key { background: rgba(79, 193, 255, 0.22); color: #4fc1ff; padding: 0 4px; border-radius: 2px; }
   .miss-key { background: rgba(244, 71, 71, 0.25); color: #f48771; padding: 0 4px; border-radius: 2px; }
   .scope-note { margin-top: 6px; font-size: 12px; color: var(--vscode-descriptionForeground, #9d9d9d); }
   .question {
@@ -255,12 +262,6 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   ${result.commits !== undefined && !result.error
     ? `<div class="count-bar">${count} commit${count !== 1 ? 's' : ''} found</div>`
     : ''}
-
-  ${result.intent.type === 'FULL_HISTORY' ? `
-  <div class="merge-legend">
-    <span><span class="badge merge-badge">⇄ merge</span> = merge commit</span>
-    <span><span class="badge auto-conflict">⚠ auto-merge</span> = auto conflict resolution — may have silently dropped changes</span>
-  </div>` : ''}
 
   ${body}
 

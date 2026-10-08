@@ -24,6 +24,10 @@ export interface Intent {
     // When the user gave a multi-line block: all its (trimmed, non-empty) lines. searchString is then the
     // longest of them, used only to find candidate commits; each commit is then checked against the whole block.
     blockLines?: string[];
+    // The single line the user originally selected, when the lines in lineContext/blockLines were only added to identify
+    // WHICH copy of it was meant (for example the related list around a repeated <fields>NAME</fields>). The history shown
+    // is then that line's, found inside that block, not the history of every line of the block.
+    focusLine?: string;
     searchString?: string;
     branch?: string;
     commitHash?: string;
@@ -157,7 +161,7 @@ export function describeIntent(intent: Intent): string {
         case 'FIND_BOTH':
             return `Tracing full history of "${intent.searchString}"${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'LINE_HISTORY':
-            return `Tracing this exact line by position${intent.branch ? ` on ${intent.branch}` : ''}`;
+            return `Tracing this line${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'FULL_HISTORY':
             return `Showing full commit history of this file${intent.branch ? ` on ${intent.branch}` : ''}`;
         case 'RECENT_HISTORY':

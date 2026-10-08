@@ -2,7 +2,7 @@
   "name": "vscode-git-ask",
   "displayName": "Git Ask",
   "description": "Ask git history questions in plain English for any file",
-  "version": "1.5.0",
+  "version": "1.6.1",
   "publisher": "naveengit9",
   "engines": {
     "vscode": "^1.85.0"
@@ -20,10 +20,6 @@
         "title": "Git Ask: Trace this line's lifecycle (when added / removed)"
       },
       {
-        "command": "gitask.fullHistory",
-        "title": "Git Ask: Full history (incl. merge commits)"
-      },
-      {
         "command": "gitask.traceRemoved",
         "title": "Git Ask: Trace a line/block which is no longer present"
       }
@@ -36,13 +32,8 @@
           "when": "editorIsOpen"
         },
         {
-          "command": "gitask.fullHistory",
-          "group": "gitask@2",
-          "when": "editorIsOpen"
-        },
-        {
           "command": "gitask.traceRemoved",
-          "group": "gitask@3",
+          "group": "gitask@2",
           "when": "editorIsOpen"
         }
       ],
@@ -52,12 +43,8 @@
           "group": "gitask@1"
         },
         {
-          "command": "gitask.fullHistory",
-          "group": "gitask@2"
-        },
-        {
           "command": "gitask.traceRemoved",
-          "group": "gitask@3"
+          "group": "gitask@2"
         }
       ]
     },

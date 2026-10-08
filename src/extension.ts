@@ -4,6 +4,7 @@ import { execFileSync } from 'child_process';
 import { executeIntent } from './gitService';
 import { showResults } from './resultsPanel';
 import { Intent, LineContext } from './intentParser';
+import { countOccurrences, expandToUniqueBlock } from './expandBlock';
 
 function getActiveFilePath(uri?: vscode.Uri): string | undefined {
     if (uri) return uri.fsPath;
@@ -62,8 +63,45 @@ function getSelectedBlock(filePath: string): string[] | undefined {
 }
 
 // Header text for the results panel: the line itself, or a short label for a block.
-function questionLabel(searchText: string, block?: string[]): string {
+function questionLabel(searchText: string, block?: string[], focusLine?: string): string {
+    if (block && focusLine) return `${focusLine}  (the copy inside the ${block.length}-line block below)`;
     return block ? `Block of ${block.length} lines starting "${block[0]}"` : searchText;
+}
+
+// A selection whose lines occur more than once in the open file cannot say which copy was meant (a line such as
+// <fields>NAME</fields> sits in dozens of related lists). Ask for more context instead of guessing, and for XML offer to
+// select the enclosing element for the user. 'ok' = unique, carry on; 'expanded' = the selection was widened; 'stop' = cancelled.
+async function resolveRepeatedSelection(filePath: string): Promise<'ok' | 'expanded' | 'stop'> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.fsPath !== filePath) return 'ok';
+    const doc = editor.document;
+    const sel = editor.selection;
+    const first = sel.start.line;
+    const last = !sel.isEmpty && sel.end.character === 0 && sel.end.line > first ? sel.end.line - 1 : sel.end.line;
+    const all = doc.getText().split(/\r?\n/).map(l => l.trim());
+    const pattern = all.slice(first, last + 1);
+    if (pattern.every(l => l === '')) return 'ok';
+    const copies = countOccurrences(all, pattern);
+    if (copies <= 1) return 'ok';
+
+    const what = pattern.length === 1 ? 'line' : 'block';
+    const isXml = doc.languageId === 'xml' || /\.xml$/i.test(filePath);
+    const expandLabel = 'Expand to the enclosing block';
+    const choice = await vscode.window.showWarningMessage(
+        `This ${what} appears ${copies} times in this file, so Git Ask cannot tell which one you mean. ` +
+        `Select the whole block it belongs to (for example from <relatedLists> to </relatedLists>), or add a few lines around it, then trace again.`,
+        ...(isXml ? [expandLabel] : []),
+    );
+    if (choice !== expandLabel) return 'stop';
+
+    const range = expandToUniqueBlock(doc.getText().split(/\r?\n/), first);
+    if (!range) {
+        void vscode.window.showInformationMessage('Git Ask could not find a block around this line that appears only once. Select the block yourself, then trace again.');
+        return 'stop';
+    }
+    editor.selection = new vscode.Selection(range.start, 0, range.end, doc.lineAt(range.end).text.length);
+    editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    return 'expanded';
 }
 
 async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {
@@ -76,8 +114,23 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
     // Use selected text; if none, let user type it
     let searchText = getSelectedText();
     // A line taken from the editor is traced by its position; typed text can only be searched for.
-    const lineContext = searchText ? getLineContext(filePath) : undefined;
-    const blockLines = searchText ? getSelectedBlock(filePath) : undefined;
+    let lineContext = searchText ? getLineContext(filePath) : undefined;
+    let blockLines = searchText ? getSelectedBlock(filePath) : undefined;
+
+    // When the selection is widened to a block, the block only says WHICH copy of the line was meant; the line the user
+    // originally selected is what gets traced.
+    let focusLine: string | undefined;
+    if (searchText && lineContext) {
+        const originalLine = lineContext.lines.length === 1 ? lineContext.lines[0] : undefined;
+        const outcome = await resolveRepeatedSelection(filePath);
+        if (outcome === 'stop') return;
+        if (outcome === 'expanded') {
+            searchText = getSelectedText();
+            lineContext = getLineContext(filePath);
+            blockLines = getSelectedBlock(filePath);
+            focusLine = originalLine;
+        }
+    }
 
     if (!searchText) {
         searchText = await vscode.window.showInputBox({
@@ -90,7 +143,7 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
 
     if (!searchText?.trim()) return;
 
-    await askBranchAndTrace(context, filePath, searchText.trim(), lineContext, blockLines);
+    await askBranchAndTrace(context, filePath, searchText.trim(), lineContext, blockLines, focusLine);
 }
 
 const RECENT_BRANCHES_KEY = 'gitask.recentBranches';
@@ -152,7 +205,7 @@ async function pickBranch(context: vscode.ExtensionContext, filePath: string, ti
 }
 
 async function askBranchAndTrace(
-    context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext, blockLines?: string[],
+    context: vscode.ExtensionContext, filePath: string, searchText: string, lineContext?: LineContext, blockLines?: string[], focusLine?: string,
 ): Promise<void> {
     const branch = await pickBranch(context, filePath, 'Git Ask: which branch to trace?');
     if (branch === undefined) return;   // cancelled
@@ -164,13 +217,14 @@ async function askBranchAndTrace(
                 type:             lineContext ? 'LINE_HISTORY' : 'FIND_BOTH',
                 lineContext,
                 blockLines,
+                focusLine,
                 searchString:     searchText,
                 branch:           branch.trim() || undefined,
                 filePath,
                 originalQuestion: searchText,
             };
             const result = await executeIntent(intent);
-            showResults(context, result, questionLabel(searchText, blockLines));
+            showResults(context, result, questionLabel(searchText, blockLines, focusLine));
         }
     );
 }
@@ -225,38 +279,10 @@ async function traceRemovedLine(context: vscode.ExtensionContext, uri?: vscode.U
     await askBranchAndTrace(context, filePath, searchText.trim(), undefined, blockLines);
 }
 
-async function fullHistoryCommand(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {
-    const filePath = getActiveFilePath(uri);
-    if (!filePath) {
-        vscode.window.showErrorMessage('Git Ask: Open a file first.');
-        return;
-    }
-
-    const branch = await pickBranch(context, filePath, 'Git Ask: full history — which branch?');
-    if (branch === undefined) return;   // cancelled
-
-    await vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Git Ask: loading history...', cancellable: false },
-        async () => {
-            const intent: Intent = {
-                type:             'FULL_HISTORY',
-                branch:           branch?.trim() || undefined,
-                filePath,
-                originalQuestion: 'show full history',
-            };
-            const result = await executeIntent(intent);
-            showResults(context, result, `Full history${branch ? ` on ${branch}` : ' (all branches)'}`);
-        }
-    );
-}
-
 export function activate(context: vscode.ExtensionContext): void {
     context.subscriptions.push(
         vscode.commands.registerCommand('gitask.trace',
             (uri?: vscode.Uri) => traceLifecycle(context, uri)
-        ),
-        vscode.commands.registerCommand('gitask.fullHistory',
-            (uri?: vscode.Uri) => fullHistoryCommand(context, uri)
         ),
         vscode.commands.registerCommand('gitask.traceRemoved',
             (uri?: vscode.Uri) => traceRemovedLine(context, uri)

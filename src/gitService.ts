@@ -69,11 +69,33 @@ function getRelativePath(repoRoot: string, absPath: string): string {
     return path.relative(repoRoot, absPath).replace(/\\/g, '/');
 }
 
-function branchArg(branch?: string): string {
+function branchArg(branch: string | undefined, repoRoot: string): string {
     if (!branch) return '--all';
-    // Accept plain names like "rbkqa", auto-prefix with origin/
-    if (branch.startsWith('origin/') || branch.startsWith('refs/')) return branch;
+    // The branch picker passes fully qualified refs (refs/heads/x for a local branch, refs/remotes/origin/x for a remote one).
+    if (branch.startsWith('refs/')) return branch;
+    // Anything typed is resolved the way git itself resolves it: "rbkuat" is the local branch, "origin/rbkuat" the remote one,
+    // and HEAD, tags and commit hashes work too.
+    const resolved = spawnSync('git', ['rev-parse', '--verify', '--quiet', `${branch}^{commit}`], { cwd: repoRoot });
+    if (resolved.status === 0) return branch;
+    // A bare name that exists only on the remote (how earlier versions read "rbkqa").
     return `origin/${branch}`;
+}
+
+// A branch name for people: "rbkuat (local)" or "origin/rbkuat (remote)", so the two are never confused in a result.
+function describeRef(ref: string, repoRoot: string): string {
+    if (ref === 'HEAD') {
+        try {
+            const b = runArgs(['rev-parse', '--abbrev-ref', 'HEAD'], repoRoot).trim();
+            return b && b !== 'HEAD' ? `${b} (local, checked out)` : 'HEAD';
+        } catch { return 'HEAD'; }
+    }
+    let full = ref;
+    if (!ref.startsWith('refs/')) {
+        try { full = runArgs(['rev-parse', '--symbolic-full-name', ref], repoRoot).trim() || ref; } catch { return ref; }
+    }
+    if (full.startsWith('refs/heads/')) return `${full.slice('refs/heads/'.length)} (local)`;
+    if (full.startsWith('refs/remotes/')) return `${full.slice('refs/remotes/'.length)} (remote)`;
+    return ref;
 }
 
 function run(cmd: string, cwd: string): string {
@@ -834,7 +856,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
     const mk = (extra: Omit<GitResult, 'intent' | 'repoRoot' | 'relativeFile' | 'githubBaseUrl'>): GitResult =>
         ({ intent, repoRoot, relativeFile: relFile, githubBaseUrl, ...extra });
     const err = (msg: string): GitResult => mk({ error: msg });
-    const branch = branchArg(intent.branch);
+    const branch = branchArg(intent.branch, repoRoot);
     const logFmt = `--format="COMMIT_MARKER:%H|%ad|%an|%s" --date=format:"%Y-%m-%d"`;
 
     try {
@@ -850,8 +872,9 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 // A pasted block that is still partly in the file: trace its missing lines inside that block.
                 if (intent.blockLines && intent.blockLines.length > 1) {
                     const rev = branch === '--all' ? 'HEAD' : branch;
+                const revLabel = describeRef(rev, repoRoot);
                     const loss = traceBlockLoss(intent.blockLines, rev, relFile, repoRoot);
-                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev), missingLines: loss.missing });
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, revLabel), missingLines: loss.missing });
                 }
                 // Pass 1: pickaxe (no -m) — fast, finds direct commits correctly.
                 const args = [
@@ -901,6 +924,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (!ctx || ctx.lines.length === 0) return err('No line selected.');
                 // `git log -L` needs one concrete revision; with no branch given use what is checked out.
                 const rev = branch === '--all' ? 'HEAD' : branch;
+                const revLabel = describeRef(rev, repoRoot);
                 // The user selected one repeated line and then let Git Ask widen the selection to its block: the block only
                 // identifies which copy was meant, so show that line's history inside that block.
                 if (intent.focusLine && ctx.lines.length > 1) {
@@ -909,7 +933,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                         return mk({
                             commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
                             focusLine: intent.focusLine,
-                            scopeNote: `Tracing the line you selected, ${intent.focusLine}, inside the block around it on ${rev}. The block only identifies which copy you meant: ` +
+                            scopeNote: `Tracing the line you selected, ${intent.focusLine}, inside the block around it on ${revLabel}. The block only identifies which copy you meant: ` +
                                 `the history below is that line's (when it was added, merged in, removed).` + (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
                         });
                     }
@@ -920,7 +944,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 // A line that sits in several places cannot be traced reliably (by position the answer would be about whatever
                 // else happened to be at that line number), so ask for a block instead of guessing.
                 if (copies > 1) {
-                    return err(`This line appears ${copies} times in the file on ${rev}, so Git Ask cannot tell which one you mean. ` +
+                    return err(`This line appears ${copies} times in the file on ${revLabel}, so Git Ask cannot tell which one you mean. ` +
                         `Select the whole block it belongs to (for example from <relatedLists> to </relatedLists>), or add a few lines around it, and trace again.`);
                 }
                 if (copies === 1) {
@@ -928,7 +952,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                     if (life && life.entries.length > 0) {
                         return mk({
                             commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
-                            scopeNote: `This line's text appears once in the file on ${rev}, so it was traced by its content (line numbers do not matter): ` +
+                            scopeNote: `This line's text appears once in the file on ${revLabel}, so it was traced by its content (line numbers do not matter): ` +
                                 `where it was added, removed and merged in.` + (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
                         });
                     }
@@ -937,13 +961,13 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (!found && ctx.lines.length > 1) {
                     // The block is there but not exactly as selected: say which of its lines are missing and who lost them.
                     const loss = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine);
-                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, rev), missingLines: loss.missing });
+                    if (loss) return mk({ commits: enrichWithOriginBranch(loss.entries, repoRoot, branch), scopeNote: blockLossNote(loss, revLabel), missingLines: loss.missing });
                 }
                 if (!found) {
                     // The line is not in the file at this revision (removed, or on another branch): the only way to find
                     // it is by its text, which also matches every identical line in the file.
                     const fallback = await executeIntent({ ...intent, type: 'FIND_BOTH', lineContext: undefined });
-                    return { ...fallback, scopeNote: `This line is not in the file on ${rev}, so its text was searched across the whole history. ` +
+                    return { ...fallback, scopeNote: `This line is not in the file on ${revLabel}, so its text was searched across the whole history. ` +
                         `Identical lines elsewhere in the file can appear in the results.` };
                 }
                 const range = found.start === found.end ? `${found.start}` : `${found.start},${found.end}`;
@@ -961,7 +985,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                     .sort(byNewest);
                 return mk({
                     commits: enrichWithOriginBranch(all, repoRoot, branch),
-                    scopeNote: `${lineLabel} of ${rev} traced by position: the commits that changed these exact lines, plus the merges that brought them into the branch.`,
+                    scopeNote: `${lineLabel} of ${revLabel} traced by position: the commits that changed these exact lines, plus the merges that brought them into the branch.`,
                 });
             }
 

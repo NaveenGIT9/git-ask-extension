@@ -1,10 +1,10 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
-import { execFileSync } from 'child_process';
 import { executeIntent } from './gitService';
 import { showResults } from './resultsPanel';
 import { Intent, LineContext } from './intentParser';
 import { countOccurrences, expandToUniqueBlock } from './expandBlock';
+import { BranchRef, listBranchRefs, orderLocal, orderRemote } from './branches';
 
 function getActiveFilePath(uri?: vscode.Uri): string | undefined {
     if (uri) return uri.fsPath;
@@ -148,47 +148,43 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
 
 const RECENT_BRANCHES_KEY = 'gitask.recentBranches';
 
-// Remote branch names of the file's repo, without the "origin/" prefix (the same form the trace accepts).
-function listRemoteBranches(filePath: string): string[] {
-    try {
-        const out = execFileSync('git', ['for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin'], {
-            cwd: path.dirname(filePath), encoding: 'utf8', maxBuffer: 50 * 1024 * 1024,
-        });
-        return out.split('\n').map(l => l.trim()).filter(l => l.startsWith('origin/') && l !== 'origin/HEAD').map(l => l.slice('origin/'.length));
-    } catch { return []; }
-}
-
-// A searchable branch list: type "rbk" to narrow it to rbkqa, rbkuat, ... Recently used branches come first, then the
-// environment branches (no slash in the name), then the rest. Any other text typed can still be used as the branch name.
-// Returns '' for all branches and undefined when cancelled.
+// A searchable branch list that shows local and remote branches side by side, told apart by their names:
+// a local branch is "rbkuat", a remote one is "origin/rbkuat" (and the description says which). Typing "rbk" lists both.
+// Recently used branches come first, then local branches (the checked-out one first), then remote branches (environment
+// branches first). Any other text typed can still be used as the branch name (a hash, a tag, HEAD, a branch not fetched yet).
+// Returns '' for "all branches" and undefined when cancelled.
 async function pickBranch(context: vscode.ExtensionContext, filePath: string, title: string): Promise<string | undefined> {
-    const all = listRemoteBranches(filePath);
-    const recent = context.globalState.get<string[]>(RECENT_BRANCHES_KEY, []).filter(b => all.includes(b));
-    const rest = all.filter(b => !recent.includes(b));
-    const env = rest.filter(b => !b.includes('/')).sort();
-    const other = rest.filter(b => b.includes('/')).sort().reverse();   // newest-looking names (higher numbers) first
+    const { local, remote, current } = listBranchRefs(path.dirname(filePath));
+    const orderedLocal = orderLocal(local, current);
+    const orderedRemote = orderRemote(remote);
+    const byRef = new Map([...local, ...remote].map(b => [b.ref, b] as const));
+    const recentRefs = context.globalState.get<string[]>(RECENT_BRANCHES_KEY, []).filter(r => byRef.has(r));
     type Item = vscode.QuickPickItem & { branch: string };
+    const toItem = (b: BranchRef): Item => ({
+        label: b.label,
+        description: b.kind === 'local' ? (b.label === current ? 'local · checked out' : 'local') : 'remote',
+        branch: b.ref,
+    });
+    const section = (label: string): Item => ({ label, kind: vscode.QuickPickItemKind.Separator, branch: '' });
     const base: Item[] = [
-        { label: '$(repo) All branches', description: 'search every branch', branch: '' },
-        ...(recent.length ? [{ label: 'Recently used', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
-        ...recent.map(b => ({ label: b, branch: b })),
-        ...(env.length ? [{ label: 'Environment branches', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
-        ...env.map(b => ({ label: b, branch: b })),
-        ...(other.length ? [{ label: 'Feature / promotion branches', kind: vscode.QuickPickItemKind.Separator, branch: '' } as Item] : []),
-        ...other.map(b => ({ label: b, branch: b })),
+        { label: '$(repo) All branches', description: 'a line or block trace uses the branch you have checked out', branch: '' },
+        ...(recentRefs.length ? [section('Recently used'), ...recentRefs.map(r => toItem(byRef.get(r)!))] : []),
+        ...(orderedLocal.length ? [section('Local branches'), ...orderedLocal.map(toItem)] : []),
+        ...(orderedRemote.length ? [section('Remote branches'), ...orderedRemote.map(toItem)] : []),
     ];
+    const known = new Set([...local, ...remote].map(b => b.label));
 
     const picked = await new Promise<Item | undefined>(resolve => {
         const qp = vscode.window.createQuickPick<Item>();
         qp.title = title;
-        qp.placeholder = 'Type to search branches (for example: rbk)';
+        qp.placeholder = 'Type to search (for example: rbk). Local branches are plain names, remote ones start with origin/';
         qp.ignoreFocusOut = true;
         qp.matchOnDescription = true;
         qp.items = base;
         qp.onDidChangeValue(value => {
             const v = value.trim();
-            // Text that is not a known branch can still be used as typed (a branch that was not fetched, or a ref).
-            qp.items = v && !all.includes(v)
+            // Text that is not a known branch can still be used as typed (a hash, a tag, HEAD, or a branch that is not fetched yet).
+            qp.items = v && !known.has(v)
                 ? [...base, { label: `$(search) Use "${v}"`, alwaysShow: true, branch: v }]
                 : base;
         });
@@ -197,8 +193,8 @@ async function pickBranch(context: vscode.ExtensionContext, filePath: string, ti
         qp.show();
     });
     if (!picked) return undefined;
-    if (picked.branch) {
-        const updated = [picked.branch, ...recent.filter(b => b !== picked.branch)].slice(0, 5);
+    if (byRef.has(picked.branch)) {
+        const updated = [picked.branch, ...recentRefs.filter(r => r !== picked.branch)].slice(0, 5);
         await context.globalState.update(RECENT_BRANCHES_KEY, updated);
     }
     return picked.branch;

@@ -3,7 +3,7 @@ import * as path from 'path';
 import { executeIntent } from './gitService';
 import { showResults } from './resultsPanel';
 import { Intent, LineContext } from './intentParser';
-import { countOccurrences, expandToUniqueBlock } from './expandBlock';
+import { BlockRange, countOccurrences, expandToUniqueBlock } from './expandBlock';
 import { BranchRef, listBranchRefs, orderLocal, orderRemote } from './branches';
 
 function getActiveFilePath(uri?: vscode.Uri): string | undefined {
@@ -41,8 +41,11 @@ function getLineContext(filePath: string): LineContext | undefined {
     const first = sel.start.line;
     // A selection that ends at column 0 of the next line does not include that line.
     const last = !sel.isEmpty && sel.end.character === 0 && sel.end.line > first ? sel.end.line - 1 : sel.end.line;
+    return lineContextFor(editor.document, first, last);
+}
+
+function lineContextFor(doc: vscode.TextDocument, first: number, last: number): LineContext | undefined {
     if (last - first >= 200) return undefined;
-    const doc = editor.document;
     const trimmed = (n: number): string => doc.lineAt(n).text.trim();
     const lines: string[] = [];
     for (let n = first; n <= last; n++) lines.push(trimmed(n));
@@ -70,8 +73,9 @@ function questionLabel(searchText: string, block?: string[], focusLine?: string)
 
 // A selection whose lines occur more than once in the open file cannot say which copy was meant (a line such as
 // <fields>NAME</fields> sits in dozens of related lists). Ask for more context instead of guessing, and for XML offer to
-// select the enclosing element for the user. 'ok' = unique, carry on; 'expanded' = the selection was widened; 'stop' = cancelled.
-async function resolveRepeatedSelection(filePath: string): Promise<'ok' | 'expanded' | 'stop'> {
+// find the enclosing element. 'ok' = unique, carry on; a range = the block that identifies the copy (the editor selection
+// stays on the user's line, since only that line is traced); 'stop' = cancelled.
+async function resolveRepeatedSelection(filePath: string): Promise<'ok' | BlockRange | 'stop'> {
     const editor = vscode.window.activeTextEditor;
     if (!editor || editor.document.uri.fsPath !== filePath) return 'ok';
     const doc = editor.document;
@@ -99,9 +103,7 @@ async function resolveRepeatedSelection(filePath: string): Promise<'ok' | 'expan
         void vscode.window.showInformationMessage('Git Ask could not find a block around this line that appears only once. Select the block yourself, then trace again.');
         return 'stop';
     }
-    editor.selection = new vscode.Selection(range.start, 0, range.end, doc.lineAt(range.end).text.length);
-    editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
-    return 'expanded';
+    return range;
 }
 
 async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri): Promise<void> {
@@ -124,11 +126,21 @@ async function traceLifecycle(context: vscode.ExtensionContext, uri?: vscode.Uri
         const originalLine = lineContext.lines.length === 1 ? lineContext.lines[0] : undefined;
         const outcome = await resolveRepeatedSelection(filePath);
         if (outcome === 'stop') return;
-        if (outcome === 'expanded') {
-            searchText = getSelectedText();
-            lineContext = getLineContext(filePath);
-            blockLines = getSelectedBlock(filePath);
+        const editor = vscode.window.activeTextEditor;
+        if (typeof outcome === 'object' && editor && originalLine) {
+            lineContext = lineContextFor(editor.document, outcome.start, outcome.end);
+            blockLines = lineContext?.lines.filter(l => l.length > 0);
             focusLine = originalLine;
+            searchText = originalLine;
+        } else if (typeof outcome === 'object') {
+            // A repeated multi-line selection: the whole widened block is what is traced.
+            lineContext = editor ? lineContextFor(editor.document, outcome.start, outcome.end) : undefined;
+            blockLines = lineContext?.lines.filter(l => l.length > 0);
+            searchText = blockLines?.slice().sort((a, b) => b.length - a.length)[0];
+            if (editor) {
+                editor.selection = new vscode.Selection(outcome.start, 0, outcome.end, editor.document.lineAt(outcome.end).text.length);
+                editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 import { execSync, spawnSync } from 'child_process';
 import * as path from 'path';
 import { Intent, LineContext } from './intentParser';
+import { BlockRegion, anchorLines, bestBlockRegion } from './blockRegion';
 
 export interface CommitEntry {
     hash: string;
@@ -335,7 +336,8 @@ function commitInfo(hash: string, repoRoot: string): CommitInfo {
 // "Merging feature/X to promotion/Y ..." -> the merge is created on Y (first parent = Y's old tip),
 // X is the second parent.
 function parseMergeMessage(message: string): { src?: string; dst?: string } {
-    const m = message.match(/Merging (\S+) (?:to|into) (\S+)/i);
+    // Copado: "Merging feature/US-1 to promotion/P2"; environment syncs: "Sync: merge rbkqa into rbkintslmk via sync/..."
+    const m = message.match(/\bmerg(?:e|ing) (\S+) (?:to|into) (\S+)/i);
     return m ? { src: m[1], dst: m[2] } : {};
 }
 
@@ -605,32 +607,6 @@ function annotateBlock(commits: CommitEntry[], block: string[], relFile: string,
     });
 }
 
-interface BlockRegion { score: number; lines: Set<string> }
-
-// Finds where a block sits in a file: spans that start at a line equal to the block's first line and end at the
-// next line equal to its last, scored by how many of the block's distinct lines they contain. The best span wins.
-// This is what tells apart "<fields>NAME</fields> inside THIS related list" from the same line in all the others.
-function bestBlockRegion(fileLines: string[], block: string[], approxLine?: number): BlockRegion | undefined {
-    const distinct = [...new Set(block)];
-    const first = block[0];
-    const last = block[block.length - 1];
-    const maxSpan = block.length * 3 + 5;
-    let best: (BlockRegion & { start: number }) | undefined;
-    for (let i = 0; i < fileLines.length; i++) {
-        if (fileLines[i] !== first) continue;
-        let j = -1;
-        for (let k = i + 1; k < fileLines.length && k <= i + maxSpan; k++) {
-            if (fileLines[k] === last) { j = k; break; }
-        }
-        if (j < 0) continue;
-        const lines = new Set(fileLines.slice(i, j + 1));
-        const score = distinct.filter(l => lines.has(l)).length;
-        const nearer = best && approxLine !== undefined && Math.abs(i + 1 - approxLine) < Math.abs(best.start + 1 - approxLine);
-        if (!best || score > best.score || (score === best.score && nearer)) best = { score, lines, start: i };
-    }
-    const needed = Math.max(2, Math.ceil(distinct.length * 0.6));
-    return best && best.score >= needed ? { score: best.score, lines: best.lines } : undefined;
-}
 
 /**
  * For a block that no longer matches the file as it is at `rev`: find which of its lines are missing from the
@@ -649,8 +625,15 @@ function traceBlockLoss(
     const wholeFile = opts.wholeFile === true;
     if (block.length < (wholeFile ? 1 : 2)) return undefined;
     const where = wholeFile ? 'this file' : 'this block';
+    // focus: one line inside the block. The block only says which copy is meant; that line's whole life inside the block is wanted.
+    const focus = opts.focus && block.includes(opts.focus) ? opts.focus : undefined;
+    let anchors: string[] = [];
+    if (focus) {
+        try { anchors = anchorLines(runArgs(['show', `${rev}:${relFile}`], repoRoot).split(/\r?\n/).map(l => l.trim()), block, focus); }
+        catch { return undefined; }
+    }
     const regionOf = (lines: string[]): BlockRegion | null => {
-        if (!wholeFile) return bestBlockRegion(lines, block, approxLine) ?? null;
+        if (!wholeFile) return bestBlockRegion(lines, block, approxLine, anchors) ?? null;
         const inFile = new Set(lines);
         return { score: 1, lines: new Set(block.filter(l => inFile.has(l))) };   // only the lines of interest are kept
     };
@@ -700,8 +683,6 @@ function traceBlockLoss(
     const tipRegion = regionAt(rev);
     const distinctLines = [...new Set(block)];
     if (wholeFile && !tipRegion) return undefined;   // the file itself is not at this revision
-    // focus: one line inside the block. The block only says which copy is meant; that line's whole life inside the block is wanted.
-    const focus = opts.focus && distinctLines.includes(opts.focus) ? opts.focus : undefined;
     if (focus && !tipRegion) return undefined;       // the block is not at this revision, so there is no copy to follow
     // In whole-file mode the line's whole life is wanted, whether or not it is in the file now.
     const missing = focus ? [focus] : wholeFile ? distinctLines : tipRegion ? distinctLines.filter(l => stateAt(rev, l) === 'N') : distinctLines;
@@ -725,9 +706,10 @@ function traceBlockLoss(
             const carried = candidates.some(([other]) => other !== hash && isAncestor(other, parents[1], repoRoot));
             const from = src ?? 'the other branch';
             const into = dst ?? 'this branch';
+            const whatLower = what.charAt(0).toLowerCase() + what.slice(1);
             const note = carried
-                ? `Carried over from ${from} into ${into}. ${from} already had ${what} (they reached it through an earlier merge); ${into} did not have ${pronoun} before this merge.`
-                : `Merged ${from} into ${into}. ${what} came from ${from}; ${into} did not have ${pronoun} before this merge.`;
+                ? `${into} gets ${whatLower} here, copied from ${from}. Not a new change: ${from} already had ${pronoun} from an earlier merge.`
+                : `${into} gets ${whatLower} here, merged in from ${from}, where ${pronoun} was written.`;
             return {
                 hash: info.hash, shortHash: info.hash.slice(0, 7), date: info.date, ts: info.ts, author: info.author, message: info.message,
                 action: '+' as const, lines, isMerge: true, isAutoConflict: info.message.toLowerCase().includes('auto conflict'),
@@ -928,15 +910,21 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 // The user selected one repeated line and then let Git Ask widen the selection to its block: the block only
                 // identifies which copy was meant, so show that line's history inside that block.
                 if (intent.focusLine && ctx.lines.length > 1) {
+                    // Never fall back to a position trace of the whole block here: that would report commits about the block's
+                    // other lines (or about other blocks), not about the line that was selected.
                     const life = traceBlockLoss(ctx.lines, rev, relFile, repoRoot, ctx.approxLine, { focus: intent.focusLine });
-                    if (life && life.entries.length > 0) {
-                        return mk({
-                            commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
-                            focusLine: intent.focusLine,
-                            scopeNote: `Tracing the line you selected, ${intent.focusLine}, inside the block around it on ${revLabel}. The block only identifies which copy you meant: ` +
-                                `the history below is that line's (when it was added, merged in, removed).` + (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
-                        });
+                    if (!life) {
+                        return err(`The block around ${intent.focusLine} was not found in the file on ${revLabel}, so that copy of the line cannot be traced there. ` +
+                            `Pick the branch the file in the editor comes from, or select the block yourself and trace again.`);
                     }
+                    return mk({
+                        commits: enrichWithOriginBranch(life.entries, repoRoot, branch),
+                        focusLine: intent.focusLine,
+                        scopeNote: `Only ${intent.focusLine} is traced; the block just identifies which copy. ` +
+                            `Read bottom to top: the commit that wrote the line, then each merge that carried it, branch by branch, to ${revLabel}.` +
+                            (life.entries.length === 0 ? ' No commit in the checked history added or removed it.' : '') +
+                            (life.truncated ? ' Only the most recent 2000 commits of the file were checked.' : ''),
+                    });
                 }
                 // One selected line whose text appears only once in the file: its position tells nothing (other lines are
                 // inserted, edited and reordered around it all the time), so trace its content instead.

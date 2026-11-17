@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { GitResult, CommitEntry } from './gitService';
+import { Rebuild } from './rebuild';
 import { describeIntent } from './intentParser';
 
 let panel: vscode.WebviewPanel | undefined;
@@ -27,13 +28,43 @@ function escapeHtml(s: string): string {
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
+function isoDay(ts: number): string {
+    return new Date(ts * 1000).toISOString().slice(0, 10);
+}
+
+function rebuildBanner(rb: Rebuild): string {
+    const [b, from] = [escapeHtml(rb.branch), escapeHtml(rb.from)];
+    const verb = rb.oldHistoryRef ? 'was rebuilt from' : 'started from';
+    const old = rb.oldHistoryRef
+        ? ` Its own history from before then is on <span class="rb-branch">${escapeHtml(rb.oldHistoryRef)}</span>, which this trace does not read.`
+        : '';
+    return `<div class="rebuild-banner">
+        <div class="rb-title">⟲ ${b} ${verb} ${from} on ${escapeHtml(formatDate(isoDay(rb.restartTs)))}</div>
+        <div>Rows marked <span class="badge rb-badge">${from} history</span> happened on ${from} (and the promotions into it) before that.
+        They are in ${b}'s history only because ${b} ${verb} ${from}'s commit <code>${escapeHtml(rb.takenHash.slice(0, 7))}</code>.
+        Only the rows after the divider are changes made through ${b}.${old}</div>
+    </div>`;
+}
+
+function rebuildDivider(rb: Rebuild): string {
+    const verb = rb.oldHistoryRef ? 'restarted from' : 'started from';
+    return `<div class="rebuild-divider"><span>⟲ ${escapeHtml(formatDate(isoDay(rb.restartTs)))}: ${escapeHtml(rb.branch)} ${verb} ${escapeHtml(rb.from)} (${escapeHtml(rb.takenHash.slice(0, 7))}). Below: ${escapeHtml(rb.branch)}'s own history.</span></div>`;
+}
+
+function renderCommits(commits: CommitEntry[], githubBaseUrl?: string, rebuild?: Rebuild): string {
     if (commits.length === 0) {
         return `<div class="empty">No commits found matching your query.</div>`;
     }
     // Show oldest first so the timeline reads top→bottom: ADDED → REMOVED → RE-ADDED
     const ordered = [...commits].reverse();
-    return ordered.map(c => {
+    // The divider goes after the last row that predates the rebuild (rows are ordered by time, so they come first).
+    let lastBefore = -1;
+    ordered.forEach((c, i) => { if (c.beforeRebuild) lastBefore = i; });
+    return ordered.map((c, i) => renderCommit(c, githubBaseUrl, rebuild) + (rebuild && i === lastBefore ? rebuildDivider(rebuild) : '')).join('');
+}
+
+function renderCommit(c: CommitEntry, githubBaseUrl?: string, rebuild?: Rebuild): string {
+    {
         const commitUrl  = githubBaseUrl ? `${githubBaseUrl}/commit/${c.hash}` : '';
         const hashEl     = commitUrl
             ? `<a class="hash hash-link" data-url="${commitUrl}" title="Open on GitHub">${escapeHtml(c.shortHash)}</a>`
@@ -61,18 +92,26 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
             ? `<span class="badge dropped-badge">✖ line lost here</span>`
             : c.removalRole === 'carried'
             ? `<span class="badge carried-badge">↳ carried removal in</span>`
+            : c.removalRole === 'not-carried'
+            ? `<span class="badge dropped-badge">✖ change not carried in</span>`
             : '';
-        const commitClass = c.removalRole === 'dropped'
+        const commitClass = (c.removalRole === 'dropped' || c.removalRole === 'not-carried'
             ? 'commit dropped-commit'
-            : c.isAutoConflict ? 'commit conflict-commit' : 'commit';
+            : c.isAutoConflict ? 'commit conflict-commit' : 'commit') + (c.beforeRebuild ? ' before-rebuild' : '');
+        const rebuildBadge = c.beforeRebuild && rebuild
+            ? `<span class="badge rb-badge" title="Happened before ${escapeHtml(rebuild.branch)} was rebuilt from ${escapeHtml(rebuild.from)}">${escapeHtml(rebuild.from)} history</span>`
+            : '';
         return `
         <div class="${commitClass}">
             <div class="commit-header">
-                ${c.mergeStep === 'carried-over'
+                ${c.mergeStep && c.offBranch
+                    ? `<span class="badge off-branch-badge" title="This merge happened on another branch, not on the one you traced">↗ ${c.offBranch.target ? `REACHED ${escapeHtml(c.offBranch.target.toUpperCase())}` : 'OTHER BRANCH'}</span>`
+                    : c.mergeStep === 'carried-over'
                     ? `<span class="badge carried-over-badge">↳ CARRIED OVER</span>`
                     : c.mergeStep === 'merged-in'
                     ? `<span class="badge merged-in-badge">⇄ MERGED IN</span>`
-                    : actionBadge(c.action)}
+                    : c.removalRole === 'not-carried' ? '' : actionBadge(c.action)}
+                ${rebuildBadge}
                 ${roleBadge}
                 ${mergeBadge}
                 <span class="date">${escapeHtml(formatDate(c.date))}</span>
@@ -86,12 +125,18 @@ function renderCommits(commits: CommitEntry[], githubBaseUrl?: string): string {
             ${c.lines && c.lines.length > 0 ? `
             <div class="diff-lines">
                 ${c.lines.map(l => {
-                    const cls = l.startsWith('+') ? 'diff-add' : 'diff-remove';
-                    return `<div class="diff-line ${cls}"><code>${escapeHtml(l)}</code></div>`;
+                    // The branch never had the line here, so it is neither added (green) nor removed (red).
+                    const notCarried = c.removalRole === 'not-carried';
+                    const cls = c.offBranch || notCarried ? 'diff-elsewhere' : l.startsWith('+') ? 'diff-add' : 'diff-remove';
+                    const text = notCarried ? `  ${l.replace(/^[-+] /, '')}` : l;
+                    const tag = notCarried
+                        ? `<span class="elsewhere-tag">not brought in</span>`
+                        : c.offBranch && c.mergeInto ? `<span class="elsewhere-tag">on ${escapeHtml(c.mergeInto)}</span>` : '';
+                    return `<div class="diff-line ${cls}"><code>${escapeHtml(text)}</code>${tag}</div>`;
                 }).join('')}
             </div>` : ''}
         </div>`;
-    }).join('');
+    }
 }
 
 function buildHtml(result: GitResult, question: string, webview: vscode.Webview): string {
@@ -103,7 +148,7 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
         ? `<div class="error">⚠ ${escapeHtml(result.error)}</div>`
         : result.raw
             ? `<pre class="raw">${escapeHtml(result.raw.slice(0, 100_000))}</pre>`
-            : renderCommits(result.commits ?? [], result.githubBaseUrl);
+            : renderCommits(result.commits ?? [], result.githubBaseUrl, result.rebuild);
 
     // The block the user asked about, shown above the results; lines missing from that block on the branch are marked.
     const blockLines = (result.intent.blockLines && result.intent.blockLines.length > 1)
@@ -226,7 +271,17 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   .badge.dropped-badge { background: #5a1a1a; color: #ff8a8a; border: 1px solid #a03a3a; }
   .badge.merged-in-badge   { background: #14323f; color: #4fc1ff; border: 1px solid #1f5a73; }
   .badge.carried-over-badge { background: #2a2a4a; color: #a9a9ff; border: 1px solid #4a4a8a; }
+  .badge.off-branch-badge { background: transparent; color: #4fc1ff; border: 1px dashed #1f5a73; }
   .badge.carried-badge { background: #4a2e00; color: #e0a000; border: 1px solid #7a5000; }
+  .badge.rb-badge { background: transparent; color: var(--vscode-descriptionForeground, #9d9d9d); border: 1px dashed var(--vscode-descriptionForeground, #777); text-transform: none; letter-spacing: 0; }
+  .commit.before-rebuild { opacity: 0.6; }
+  .commit.before-rebuild:hover { opacity: 1; }
+  .rebuild-banner { margin: 0 0 12px; padding: 10px 12px; font-size: 12px; line-height: 1.5; border: 1px solid var(--vscode-editorInfo-foreground, #3794ff); border-left-width: 3px; border-radius: 4px; background: color-mix(in srgb, var(--vscode-editorWidget-background, #252526) 90%, var(--vscode-editorInfo-foreground, #3794ff) 10%); }
+  .rebuild-banner .rb-title { font-weight: 700; font-size: 13px; margin-bottom: 4px; color: var(--vscode-editorInfo-foreground, #3794ff); }
+  .rebuild-banner code, .rb-branch { font-family: var(--vscode-editor-font-family, monospace); background: var(--vscode-textBlockQuote-background, #333); padding: 0 4px; border-radius: 2px; }
+  .rebuild-divider { display: flex; align-items: center; gap: 10px; margin: 14px 0; font-size: 11px; font-weight: 600; color: var(--vscode-editorInfo-foreground, #3794ff); }
+  .rebuild-divider::before, .rebuild-divider::after { content: ""; flex: 1; border-top: 2px dashed var(--vscode-editorInfo-foreground, #3794ff); }
+  .rebuild-divider span { flex: 0 1 auto; text-align: center; }
   .date   { color: var(--vscode-descriptionForeground, #858585); font-size: 12px; }
   .hash   { background: var(--vscode-textBlockQuote-background, #333); padding: 1px 5px; border-radius: 3px; font-size: 11px; color: #ce9178; font-family: monospace; }
   a.hash-link { text-decoration: none; cursor: pointer; border-bottom: 1px dashed #ce9178; }
@@ -241,6 +296,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   .diff-line { padding: 2px 0; font-size: 12px; }
   .diff-add  code { color: #4ec94e; }
   .diff-remove code { color: #f47474; }
+  .diff-elsewhere code { color: var(--vscode-descriptionForeground, #9d9d9d); }
+  .elsewhere-tag { margin-left: 8px; font-size: 10px; padding: 0 5px; border: 1px dashed var(--vscode-descriptionForeground, #777); border-radius: 3px; color: var(--vscode-descriptionForeground, #9d9d9d); }
   .raw { white-space: pre-wrap; word-break: break-all; font-size: 12px; line-height: 1.6; overflow: auto; max-height: 80vh; }
   .error { color: #f47474; padding: 12px; background: #4a1a1a; border-radius: 4px; }
   .empty { color: var(--vscode-descriptionForeground, #858585); padding: 12px; }
@@ -258,6 +315,8 @@ function buildHtml(result: GitResult, question: string, webview: vscode.Webview)
   </div>
 
   ${blockHtml}
+
+  ${result.rebuild && !result.error ? rebuildBanner(result.rebuild) : ''}
 
   ${result.commits !== undefined && !result.error
     ? `<div class="count-bar">${count} commit${count !== 1 ? 's' : ''} found</div>`

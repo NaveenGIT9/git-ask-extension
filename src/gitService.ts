@@ -2,6 +2,7 @@ import { execSync, spawnSync } from 'child_process';
 import * as path from 'path';
 import { Intent, LineContext } from './intentParser';
 import { BlockRegion, anchorLines, bestBlockRegion } from './blockRegion';
+import { Rebuild, detectRebuild, envName, isBeforeRebuild } from './rebuild';
 
 export interface CommitEntry {
     hash: string;
@@ -17,7 +18,8 @@ export interface CommitEntry {
     // Set only on the commits that explain why the line is gone from the branch tip:
     //   'dropped' = the commit that actually lost the line
     //   'carried' = a merge that brought an earlier removal into the queried branch
-    removalRole?: 'dropped' | 'carried';
+    //   'not-carried' = a merge whose merged-in side had added the line, but the merge kept the side that never had it
+    removalRole?: 'dropped' | 'carried' | 'not-carried';
     note?: string;
     // For those merges: "Merging <mergeFrom> to <mergeInto>" - the mistake happened ON mergeInto while
     // merging mergeFrom in; it is not an "origin" of the change.
@@ -28,6 +30,14 @@ export interface CommitEntry {
     // For a merge that brought the traced lines into a branch: 'merged-in' = the lines were written on the merged-in
     // branch; 'carried-over' = that branch already had them from an earlier merge and this one passed them on.
     mergeStep?: 'merged-in' | 'carried-over';
+    // History the queried branch took over when it was rebuilt from another environment (see GitResult.rebuild).
+    beforeRebuild?: boolean;
+    // A merge that brought the lines into some other branch (e.g. a promotion on its way to master), not into the
+    // queried branch. `target` is where that merge went; `entry` is the queried branch's merge that later brought it in.
+    offBranch?: {
+        target?: string;
+        entry?: { hash: string; shortHash: string; date: string; from?: string; notCarried: boolean };
+    };
 }
 
 export interface GitResult {
@@ -44,6 +54,7 @@ export interface GitResult {
     missingLines?: string[];
     // The line the user asked about when a block only served to identify it (see Intent.focusLine).
     focusLine?: string;
+    rebuild?: Rebuild;
 }
 
 function getGitHubBaseUrl(repoRoot: string): string | undefined {
@@ -358,7 +369,7 @@ function firstParentPickaxe(range: string, searchString: string, relFile: string
     return out.split('\n').map(l => l.trim()).filter(Boolean);
 }
 
-function chainEntry(info: CommitInfo, role: 'dropped' | 'carried', note: string): CommitEntry {
+function chainEntry(info: CommitInfo, role: 'dropped' | 'carried' | 'not-carried', note: string): CommitEntry {
     const isMerge = info.parents.length > 1;
     const { src, dst } = isMerge ? parseMergeMessage(info.message) : { src: undefined, dst: undefined };
     return {
@@ -780,6 +791,22 @@ function traceBlockLoss(
                     }
                 }
                 entries.push({ ...chainEntry(info, role, note), lines: [`- ${line}`] });
+            } else if (mine === 'N' && parentStates[0] === 'N' && parentStates[1] === 'Y') {
+                // The merged-in side added the line after the two sides split (the merge base lacks it), yet the merge result
+                // lacks it: the change was dropped on its way in, so the commit that added it is in history without its effect.
+                const base = mergeBase(parents[0], parents[1], repoRoot);
+                if (!base || stateAt(base, line) !== 'N') continue;
+                seen.add(key);
+                const info = commitInfo(hash, repoRoot);
+                const { src, dst } = parseMergeMessage(info.message);
+                const from = src ?? 'the merged-in branch';
+                const into = dst ?? 'this branch';
+                entries.push({
+                    ...chainEntry(info, 'not-carried',
+                        `${from} had "${line}", but this merge kept ${into}'s version without it, so the line did not come in. ` +
+                        `The commit that added it is now in the history, but its change is not in the file.`),
+                    lines: [`- ${line}`],
+                });
             } else if (mine === 'Y' && !parentStates.includes('Y')) {
                 seen.add(key);
                 const info = commitInfo(hash, repoRoot);
@@ -823,7 +850,80 @@ function enrichWithOriginBranch(commits: CommitEntry[], repoRoot: string, queryB
     return commits.map(c => ({ ...c, originBranch: c.isMerge && c.mergeInto ? c.mergeInto : getOriginBranch(c.hash, repoRoot, queryBranch) }));
 }
 
+const firstParentLine = (rev: string, repoRoot: string): string[] => {
+    try { return runArgs(['rev-list', '--first-parent', rev], repoRoot).split('\n').map(l => l.trim()).filter(Boolean); }
+    catch { return []; }
+};
+
+function shortDay(isoDate: string): string {
+    const d = new Date(`${isoDate}T00:00:00Z`);
+    return Number.isNaN(d.getTime()) ? isoDate : d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+}
+
+// A "merged in" row whose merge is not on the branch's own first-parent line happened on another branch (e.g. a
+// promotion on its way to master). Say where it went, and which of the branch's own merges later brought it in.
+function relabelOffBranchMerges(commits: CommitEntry[], branch: string, repoRoot: string): CommitEntry[] {
+    const todo = commits.filter(c => c.mergeStep && !c.beforeRebuild).slice(0, 10);
+    if (!todo.length) return commits;
+    const fpList = firstParentLine(branch, repoRoot);
+    const fp = new Set(fpList);
+    const off = todo.filter(c => !fp.has(c.hash));
+    if (!off.length) return commits;
+    const name = envName(branch, repoRoot) ?? branch;
+    const mainRef = ['origin/master', 'master', 'origin/main', 'main']
+        .find(r => spawnSync('git', ['rev-parse', '--verify', '--quiet', r], { cwd: repoRoot }).status === 0);
+    const mainFp = mainRef ? new Set(firstParentLine(mainRef, repoRoot)) : new Set<string>();
+    const mainName = mainRef?.replace(/^origin\//, '');
+    const byHash = new Map(commits.map(c => [c.hash, c]));
+    const updates = new Map<string, CommitEntry>();
+    for (const c of off) {
+        const target = mainFp.has(c.hash) ? mainName : undefined;
+        // `--first-parent --ancestry-path` misses a branch merge that took the commit in through its second parent, so take
+        // all descendants and pick the oldest one on the branch's own line.
+        let entry: NonNullable<CommitEntry['offBranch']>['entry'];
+        try {
+            const desc = new Set(runArgs(['rev-list', '--ancestry-path', `${c.hash}..${branch}`], repoRoot).split('\n').map(l => l.trim()));
+            const hit = [...fpList].reverse().find(h => desc.has(h));
+            if (hit) {
+                const info = commitInfo(hit, repoRoot);
+                entry = {
+                    hash: hit, shortHash: hit.slice(0, 7), date: info.date,
+                    from: parseMergeMessage(info.message).src, notCarried: byHash.get(hit)?.removalRole === 'not-carried',
+                };
+            }
+        } catch { /* leave entry unknown */ }
+        const day = shortDay(c.date);
+        const via = c.mergeInto ?? 'another branch';
+        const first = target
+            ? `${via} got the line here on ${day}, on its way to ${target}. ${name} did not get it from this merge.`
+            : `${via} got the line here on ${day}. This merge happened on ${via}, not on ${name}.`;
+        const second = !entry ? ''
+            : ` See ${shortDay(entry.date)} (${entry.shortHash}) for when it reached ${name}.`;
+        updates.set(c.hash, { ...c, note: first + second, offBranch: { target, entry } });
+    }
+    return commits.map(c => updates.get(c.hash) ?? c);
+}
+
 export async function executeIntent(intent: Intent): Promise<GitResult> {
+    const result = await runIntent(intent);
+    if (!result.commits?.length || !result.repoRoot) return result;
+    const repoRoot = result.repoRoot;
+    const picked = branchArg(intent.branch, repoRoot);
+    // The traces read the checked-out branch when none is picked, so check that one.
+    const branch = picked === '--all' ? 'HEAD' : picked;
+    let rebuild: Rebuild | undefined;
+    try { rebuild = detectRebuild(branch, repoRoot); } catch { /* non-fatal */ }
+    let commits = result.commits;
+    if (rebuild) {
+        const rb = rebuild;
+        commits = commits.map(c => isBeforeRebuild(c.hash, rb, repoRoot) ? { ...c, beforeRebuild: true } : c);
+        if (!commits.some(c => c.beforeRebuild)) rebuild = undefined;
+    }
+    try { commits = relabelOffBranchMerges(commits, branch, repoRoot); } catch { /* non-fatal */ }
+    return { ...result, commits, ...(rebuild ? { rebuild } : {}) };
+}
+
+async function runIntent(intent: Intent): Promise<GitResult> {
     if (!intent.filePath) {
         return { intent, error: 'No file selected. Open a file in the editor first.' };
     }
@@ -954,7 +1054,7 @@ export async function executeIntent(intent: Intent): Promise<GitResult> {
                 if (!found) {
                     // The line is not in the file at this revision (removed, or on another branch): the only way to find
                     // it is by its text, which also matches every identical line in the file.
-                    const fallback = await executeIntent({ ...intent, type: 'FIND_BOTH', lineContext: undefined });
+                    const fallback = await runIntent({ ...intent, type: 'FIND_BOTH', lineContext: undefined });
                     return { ...fallback, scopeNote: `This line is not in the file on ${revLabel}, so its text was searched across the whole history. ` +
                         `Identical lines elsewhere in the file can appear in the results.` };
                 }
